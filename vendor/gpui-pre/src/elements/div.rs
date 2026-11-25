@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 //! Div is the central, reusable element that most GPUI trees will be built from.
 //! It functions as a container for other elements, and provides a number of
 //! useful features for laying out and styling its children as well as binding
@@ -905,7 +906,9 @@ pub trait InteractiveElement: Sized {
     /// Selectors are only recorded in debug builds with the `test-support`
     /// feature. Elsewhere this is a no-op, so `test-support` can stay enabled
     /// in release builds without the per-frame cost.
-    #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
+    // SIGLIFY: selectors are recorded in optimized test builds too, so tests can run
+    // in the release profile. Only test-support turns them on, and shipped builds never do.
+    #[cfg(any(test, feature = "test-support"))]
     fn debug_selector(mut self, f: impl FnOnce() -> String) -> Self {
         self.interactivity().debug_selector = Some(f());
         self
@@ -917,7 +920,7 @@ pub trait InteractiveElement: Sized {
     /// Selectors are only recorded in debug builds with the `test-support`
     /// feature. Elsewhere this is a no-op, so `test-support` can stay enabled
     /// in release builds without the per-frame cost.
-    #[cfg(not(any(test, all(debug_assertions, feature = "test-support"))))]
+    #[cfg(not(any(test, feature = "test-support")))]
     #[inline]
     fn debug_selector(self, _: impl FnOnce() -> String) -> Self {
         self
@@ -2251,7 +2254,7 @@ pub struct Interactivity {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) source_location: Option<&'static core::panic::Location<'static>>,
 
-    #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_selector: Option<String>,
 }
 
@@ -2577,7 +2580,7 @@ impl Interactivity {
 
                 let style = self.compute_style_internal(hitbox, element_state.as_mut(), window, cx);
 
-                #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some(debug_selector) = &self.debug_selector {
                     window
                         .next_frame
