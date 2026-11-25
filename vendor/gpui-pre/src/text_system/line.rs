@@ -50,24 +50,6 @@ pub struct ShapedLine {
 }
 
 impl ShapedLine {
-    /// HERDR: Place terminal clusters at explicit cell boundaries. UI shaping is unchanged.
-    pub fn with_cell_positions(mut self, positions: &[(usize, Pixels)], width: Pixels) -> Self {
-        let layout = Arc::make_mut(&mut self.layout);
-        let mut cluster = None;
-        for run in &mut layout.runs {
-            for glyph in &mut run.glyphs {
-                let offset = positions.partition_point(|(index, _)| *index <= glyph.index).saturating_sub(1);
-                if cluster.is_none_or(|(index, _)| index != offset) {
-                    let target = positions.get(offset).map_or(px(0.), |(_, x)| *x);
-                    cluster = Some((offset, target - glyph.position.x));
-                }
-                glyph.position.x += cluster.unwrap().1;
-            }
-        }
-        layout.width = width;
-        self
-    }
-
     /// Returns a forward-only cursor for this shaped line.
     pub fn cursor(&self) -> ShapedLineCursor<'_> {
         assert_eq!(
@@ -750,12 +732,11 @@ fn paint_line(
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
-                        window.paint_emoji_with_color(
+                        window.paint_emoji(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
-                            color,
                         )?;
                     } else {
                         window.paint_glyph(
@@ -918,7 +899,7 @@ fn paint_line_background(
                 }
 
                 if let Some((mut background_origin, background_color)) = finished_background {
-                    let mut width = glyph_origin.x - background_origin.x;
+                    let width = glyph_origin.x - background_origin.x;
                     if background_origin.x == glyph_origin.x {
                         background_origin.x -= max_glyph_size.width.half();
                     };

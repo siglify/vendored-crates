@@ -556,34 +556,6 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
     return output;
 }
 
-// HERDR: a quad with a solid background, no border and no rounding (most
-// backgrounds and panels). It skips `quad_fragment`, which WARP (software
-// D3D) runs in full for every pixel whatever branch the pixel takes.
-struct PlainQuadVertexOutput {
-    float4 position: SV_Position;
-    nointerpolation float4 color: COLOR0;
-    float4 clip_distance: SV_ClipDistance;
-};
-
-struct PlainQuadFragmentInput {
-    float4 position: SV_Position;
-    nointerpolation float4 color: COLOR0;
-};
-
-PlainQuadVertexOutput plain_quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
-    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
-    Quad quad = quads[batch_start_index + instance_id];
-    PlainQuadVertexOutput output;
-    output.position = to_device_position(unit_vertex, quad.bounds);
-    output.color = hsla_to_rgba(quad.background.solid);
-    output.clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
-    return output;
-}
-
-float4 plain_quad_fragment(PlainQuadFragmentInput input): SV_Target {
-    return input.color;
-}
-
 float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
     float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
@@ -1168,10 +1140,10 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
 struct MonochromeSprite {
     uint order;
     uint pad;
+    AtlasTile tile;
     Bounds bounds;
     Bounds content_mask;
     Hsla color;
-    AtlasTile tile;
     TransformationMatrix transformation;
 };
 
@@ -1241,12 +1213,12 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 struct PolychromeSprite {
     uint order;
     uint pad;
+    AtlasTile tile;
     uint grayscale;
     float opacity;
     Bounds bounds;
     Bounds content_mask;
     Corners corner_radii;
-    AtlasTile tile;
 };
 
 struct PolychromeSpriteVertexOutput {
