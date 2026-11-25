@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 // Modified for gpui-pre (snapshot of zed@d2a4fb6): adapt device queues and sRGB detection to wgpu 30.0.1.
 use anyhow::{Context as _, Result};
 use etagere::{BucketedAtlasAllocator, size2};
@@ -122,6 +123,10 @@ impl PlatformAtlas for WgpuAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
+    }
+
+    fn remove_svg(&self, path: &str) {
+        self.0.lock().remove_svg(path);
     }
 }
 

@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 use std::{
     cell::{Cell, RefCell},
     ffi::{OsStr, OsString},
@@ -1181,6 +1182,7 @@ impl WindowsPlatformInner {
     }
 
     fn translate_accelerator(&self, msg: &MSG) -> bool {
+        DEAD_KEYS.with(|state| state.observe(msg));
         if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
             return false;
         }
@@ -1391,6 +1393,7 @@ impl WindowsPlatformInner {
     }
 
     fn handle_keyboard_layout_change(&self) -> Option<isize> {
+        DEAD_KEYS.with(DeadKeyState::clear);
         self.with_callback(
             |callbacks| &callbacks.keyboard_layout_change,
             |callback| callback(),

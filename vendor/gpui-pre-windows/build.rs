@@ -1,4 +1,5 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 
 fn main() {
     #[cfg(not(all(target_os = "windows", not(debug_assertions))))]
@@ -33,6 +34,7 @@ mod shader_compilation {
         // Define all modules
         let modules = [
             "quad",
+            "plain_quad",
             "shadow",
             "path_rasterization",
             "path_sprite",

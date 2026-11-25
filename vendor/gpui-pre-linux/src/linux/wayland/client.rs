@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 use std::{
     cell::{RefCell, RefMut},
     hash::Hash,
@@ -1009,7 +1010,8 @@ impl WaylandConnection {
         globals.contents().with_list(|list| -> anyhow::Result<()> {
             for global in list {
                 match &global.interface[..] {
-                    "wl_seat" => {
+                    // Until multi-seat support exists, keep all input devices on the first seat.
+                    "wl_seat" if seat.is_none() => {
                         seat = Some(globals.registry().bind::<wl_seat::WlSeat, _, _>(
                             global.name,
                             wl_seat_version(global.version)?,
@@ -1608,20 +1610,8 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                 interface,
                 version,
             } => match &interface[..] {
-                "wl_seat" => {
-                    let Ok(version) = wl_seat_version(version) else {
-                        log::error!("ignoring wl_seat below the required version");
-                        return;
-                    };
-                    if let Some(wl_pointer) = state.wl_pointer.take() {
-                        wl_pointer.release();
-                    }
-                    if let Some(wl_keyboard) = state.wl_keyboard.take() {
-                        wl_keyboard.release();
-                    }
-                    state.wl_seat.release();
-                    state.wl_seat = registry.bind::<wl_seat::WlSeat, _, _>(name, version, qh, ());
-                }
+                // A new seat must not replace the seat used by our input and data devices.
+                "wl_seat" => {}
                 "wl_output" => {
                     let Ok(version) = wl_output_version(version) else {
                         log::error!("ignoring wl_output below the required version");
@@ -2183,6 +2173,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                     wl_keyboard::KeyState::Pressed if !keysym.is_modifier_key() => {
                         let mut keystroke =
                             keystroke_from_xkb(keymap_state, state.modifiers, keycode);
+                        let mut composed_text = None;
                         if let Some(mut compose) = state.compose_state.take() {
                             compose.feed(keysym);
                             match compose.status() {
@@ -2203,6 +2194,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                     if let Some(keysym) = compose.keysym() {
                                         keystroke.key = xkb::keysym_get_name(keysym);
                                     }
+                                    composed_text = keystroke.key_char.clone();
                                 }
                                 xkb::Status::Cancelled => {
                                     let pre_edit = state.pre_edit_text.take();
@@ -2221,7 +2213,14 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                 }
                                 _ => {}
                             }
+                            let composing = compose.status() == xkb::Status::Composing;
                             state.compose_state = Some(compose);
+                            if composing {
+                                // SIGLIFY: a dead key's physical US key must not reach Kitty input.
+                                state.repeat.current_id += 1;
+                                state.repeat.current_keycode = None;
+                                return;
+                            }
                         }
                         let input = PlatformInput::KeyDown(KeyDownEvent {
                             keystroke: keystroke.clone(),
@@ -2270,7 +2269,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                             .unwrap();
 
                         drop(state);
-                        focused_window.handle_input(input);
+                        if let Some(text) = composed_text {
+                            // Commit through IME so the marked accent is replaced and cleared.
+                            focused_window.handle_ime(ImeInput::InsertText(text));
+                        } else {
+                            focused_window.handle_input(input);
+                        }
                     }
                     wl_keyboard::KeyState::Released if !keysym.is_modifier_key() => {
                         let input = PlatformInput::KeyUp(KeyUpEvent {

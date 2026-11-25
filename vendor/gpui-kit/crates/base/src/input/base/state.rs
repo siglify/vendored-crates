@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 //! A text input field that allows the user to enter text.
 //!
 //! Based on the `Input` example from the `gpui` crate.
@@ -7,7 +8,7 @@ use gpui::{
     Action, App, AppContext, Bounds, ClipboardItem, Context, Edges, Entity, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point,
-    Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Subscription,
+    Render, ScrollHandle, ScrollEvent, SharedString, Styled as _, Subscription,
     UTF16Selection, WeakFocusHandle, Window, actions, div, point, prelude::FluentBuilder as _, px,
 };
 use ropey::{Rope, RopeSlice};
@@ -172,7 +173,11 @@ pub(crate) fn init(cx: &mut App) {
             Some(CONTEXT),
         ),
         KeyBinding::new(
-            "secondary-enter",
+            if cx.platform_info().is_mac() {
+                "cmd-enter"
+            } else {
+                "ctrl-enter"
+            },
             Enter {
                 secondary: true,
                 shift: false,
@@ -2579,7 +2584,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     pub(super) fn on_scroll_wheel(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -4721,7 +4726,7 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
                 window.listener_for(&entity, InputBaseState::on_mouse_up),
             )
             .on_mouse_move(window.listener_for(&entity, InputBaseState::on_mouse_move))
-            .on_scroll_wheel(window.listener_for(&entity, InputBaseState::on_scroll_wheel))
+            .on_scroll(window.listener_for(&entity, InputBaseState::on_scroll_wheel))
             .when(self.is_multi_line() && !self.disabled, |this| {
                 this.on_modifiers_changed(cx.listener(|_, _, _, cx| cx.notify()))
             })
@@ -5695,7 +5700,7 @@ mod tests {
             .update(cx, |_, window, cx| {
                 input.update(cx, |state, cx| {
                     state.on_scroll_wheel(
-                        &ScrollWheelEvent {
+                        &ScrollEvent {
                             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
                             ..Default::default()
                         },
@@ -5716,7 +5721,7 @@ mod tests {
             .update(cx, |_, window, cx| {
                 input.update(cx, |state, cx| {
                     state.on_scroll_wheel(
-                        &ScrollWheelEvent {
+                        &ScrollEvent {
                             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
                             ..Default::default()
                         },

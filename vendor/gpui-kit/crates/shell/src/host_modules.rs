@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 //! HostModule registrations — Rust functions the host lends to a script, imported by name.
 //!
 //! A script cannot load a native extension. `dlopen`-ed Rust has no stable ABI
@@ -477,6 +478,12 @@ impl HostModule {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// This module under another specifier: the copy shares every function,
+    /// so both names answer from the same state.
+    pub fn named(&self, name: impl Into<String>) -> Self {
+        Self { name: name.into(), ..self.clone() }
     }
 
     /// Registers one function.

@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 use anyhow::Result;
 use gpui::{App, Context, MouseMoveEvent, Task, Window};
 use instant::Duration;
@@ -96,7 +97,7 @@ impl InputBaseState<EditorMode> {
             self.clear_hover_state(cx);
             return;
         }
-        if event.modifiers.secondary() {
+        if event.modifiers.secondary(cx) {
             self.handle_hover_definition(offset, window, cx);
         } else {
             // Repaint only when the definition underline goes away; the hover

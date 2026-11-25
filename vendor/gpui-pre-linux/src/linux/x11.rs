@@ -1,9 +1,11 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 mod client;
 mod clipboard;
 mod display;
 mod event;
 mod window;
 mod xim_handler;
+mod xkb;
 
 pub(crate) use client::*;
 pub(crate) use clipboard::wait_for_clipboard_handovers;

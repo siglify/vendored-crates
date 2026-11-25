@@ -1,3 +1,5 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
+mod colr;
 mod cosmic_text_system;
 mod wgpu_atlas;
 mod wgpu_context;

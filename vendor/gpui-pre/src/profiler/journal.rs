@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 //! A journal of foreground work and the semantic boundaries between activity intervals.
 //!
 //! The foreground thread records task polls, action handlers, input dispatches,
@@ -440,6 +441,7 @@ impl ForegroundRunnableCounter {
     }
 
     fn finished(&self) {
+        #[allow(deprecated)]
         let _ = self
             .0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {

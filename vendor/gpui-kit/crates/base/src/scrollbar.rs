@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 use std::{cell::Cell, ops::Deref, panic::Location, rc::Rc};
 
 use instant::{Duration, Instant};
@@ -11,7 +12,7 @@ use gpui::{
     Anchor, App, Axis, Background, BorderStyle, Bounds, ContentMask, CursorStyle, Edges, Element,
     ElementId, EntityId, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
     IntoElement, IsZero, LayoutId, ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad, Pixels, Point, Position, ScrollHandle, ScrollWheelEvent, Size, Style,
+    PaintQuad, Pixels, Point, Position, ScrollHandle, ScrollEvent, Size, Style,
     TouchDragEvent, TouchPhase, UniformListScrollHandle, Window, fill, point,
     prelude::FluentBuilder, px, relative, size,
 };
@@ -1642,7 +1643,7 @@ impl Element for Scrollbar {
                         let state = scrollbar_state.clone();
                         let scroll_handle = self.scroll_handle.clone();
 
-                        move |event: &ScrollWheelEvent, phase, _, cx| {
+                        move |event: &ScrollEvent, phase, _, cx| {
                             if phase.bubble() && hitbox_bounds.contains(&event.position) {
                                 if scroll_handle.offset() != state.get().last_scroll_offset {
                                     state.set(state.get().with_last_scroll(

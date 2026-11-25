@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 //! What a script application is allowed to do.
 //!
 //! The default set is empty: a script gets no file, process, network, storage or
@@ -226,6 +227,20 @@ impl Capabilities {
 
     pub fn has_read_access(&self) -> bool {
         !self.read_roots.is_empty()
+    }
+
+    /// Delegate a directory capability to a native component under the same
+    /// policy as script filesystem calls. The returned handle cannot escape
+    /// the selected directory through path traversal or symlink substitution.
+    pub fn read_directory(&self, path: &Path) -> Result<Dir, String> {
+        let grant = self.open(path, Access::Read).map_err(|e| e.to_string())?;
+        grant.dir.open_dir(if grant.relative.as_os_str().is_empty() { Path::new(".") } else { &grant.relative }).map_err(|e| e.to_string())
+    }
+
+    /// As read_directory, but require an explicit write grant first.
+    pub fn write_directory(&self, path: &Path) -> Result<Dir, String> {
+        let grant = self.open(path, Access::Write).map_err(|e| e.to_string())?;
+        grant.dir.open_dir(if grant.relative.as_os_str().is_empty() { Path::new(".") } else { &grant.relative }).map_err(|e| e.to_string())
     }
 
     pub fn may_run(&self, command: &str) -> bool {

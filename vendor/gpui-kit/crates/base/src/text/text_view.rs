@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 use std::{ops::Range, rc::Rc, sync::Arc};
 
 use gpui::prelude::FluentBuilder as _;
@@ -1815,7 +1816,7 @@ mod tests {
             };
             let step = px(20.);
             let wheel_at = |cx: &mut VisualTestContext, y: Pixels| {
-                cx.simulate_event(gpui::ScrollWheelEvent {
+                cx.simulate_event(gpui::ScrollEvent {
                     position: point(px(20.), y),
                     delta: gpui::ScrollDelta::Pixels(point(px(0.), -step)),
                     ..Default::default()

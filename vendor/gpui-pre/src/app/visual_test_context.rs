@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 use crate::{
     Action, AnyView, AnyWindowHandle, App, AppCell, AppContext, AssetSource, BackgroundExecutor,
     Bounds, ClipboardItem, Context, Entity, EntityId, ForegroundExecutor, Global, InputEvent,
@@ -248,6 +249,7 @@ impl VisualTestAppContext {
                 modifiers: Modifiers::default(),
                 key: key.clone(),
                 key_char: Some(key),
+                ..Default::default()
             };
             self.dispatch_keystroke(window, keystroke);
         }

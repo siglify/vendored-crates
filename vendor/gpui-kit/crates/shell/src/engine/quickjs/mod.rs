@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 //! The QuickJS engine.
 //!
 //! Application code is JavaScript: ES modules, classes, arrow functions. This
@@ -2025,7 +2026,8 @@ impl ShellRuntime {
     /// while the previous runtime is alive. Its copies keep it until they finish
     /// closing, and it is freed when the last of them drops it.
     pub fn replace_default(cx: &mut App) -> Result<Rc<Self>> {
-        let runtime = Self::new_isolated_with_components(FrozenComponentRegistry::default())?;
+        let components = Self::global(cx).map(|r| r.components.clone()).unwrap_or_default();
+        let runtime = Self::new_isolated_with_components(components)?;
         runtime.set_global(cx);
         Ok(runtime)
     }
@@ -4290,7 +4292,7 @@ impl ShellRuntime {
     pub(crate) fn dispatch_scroll_wheel(
         self: &Rc<Self>,
         id: CallbackId,
-        event: &gpui::ScrollWheelEvent,
+        event: &gpui::ScrollEvent,
         line_height: gpui::Pixels,
         bounds: Option<gpui::Bounds<gpui::Pixels>>,
         window: &mut Window,

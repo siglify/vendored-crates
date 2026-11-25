@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 use scheduler::Instant;
 use std::{
     any::{TypeId, type_name},
@@ -58,7 +59,7 @@ use crate::{
     ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
     WindowInvalidator, WindowingRequest,
     colors::{Colors, GlobalColors},
-    hash, init_app_menus,
+    init_app_menus,
 };
 
 mod async_context;
@@ -301,6 +302,13 @@ impl Application {
     /// other platforms.
     pub fn with_windowing(self, request: WindowingRequest) -> Self {
         self.0.borrow().platform.set_initial_windowing(request);
+        self
+    }
+
+    /// Sets the activation policy before the native application starts.
+    /// Has no effect outside macOS.
+    pub fn with_activation_policy(self, policy: ActivationPolicy) -> Self {
+        self.0.borrow().platform.set_activation_policy(policy);
         self
     }
 
@@ -947,6 +955,8 @@ pub struct App {
 
     // assets
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
+    image_asset_recency: FxHashMap<(TypeId, u64), u64>,
+    image_asset_clock: u64,
     asset_source: Arc<dyn AssetSource>,
     pub(crate) svg_renderer: SvgRenderer,
     http_client: Arc<dyn HttpClient>,
@@ -984,6 +994,7 @@ pub struct App {
     pending_updates: usize,
     quit_mode: QuitMode,
     quitting: bool,
+    quit_guard: Rc<RefCell<Option<Rc<dyn Fn() -> bool>>>>,
 
     // We need to ensure the leak detector drops last, after all tasks, callbacks and things have been dropped.
     // Otherwise it may report false positives.
@@ -1037,6 +1048,8 @@ impl App {
                 hang_monitor: None,
                 svg_renderer: SvgRenderer::new(asset_source.clone()),
                 loading_assets: Default::default(),
+                image_asset_recency: Default::default(),
+                image_asset_clock: 0,
                 asset_source,
                 http_client,
                 globals_by_type: Default::default(),
@@ -1085,6 +1098,7 @@ impl App {
                 inspector_element_registry: InspectorElementRegistry::default(),
                 quit_mode: QuitMode::default(),
                 quitting: false,
+                quit_guard: Rc::new(RefCell::new(None)),
                 cursor_hide_mode: CursorHideMode::default(),
                 reduce_motion: false,
                 synced_animation_epoch,
@@ -1198,6 +1212,16 @@ impl App {
                     let power_mode = app.borrow().platform.power_mode();
                     app.borrow_mut().power_mode = power_mode;
                 }
+            }
+        }));
+
+        platform.on_quit_requested(Box::new({
+            // Keep this callback independent of AppCell borrows: AppKit can ask
+            // during a native event while the host has the App borrowed.
+            let guard = app.borrow().quit_guard.clone();
+            move || {
+                let callback = guard.borrow().clone();
+                callback.is_none_or(|callback| callback())
             }
         }));
 
@@ -1341,7 +1365,18 @@ impl App {
 
     /// Gracefully quit the application via the platform's standard routine.
     pub fn quit(&self) {
-        self.platform.quit();
+        let guard = self.quit_guard.borrow().clone();
+        if guard.is_none_or(|guard| guard()) {
+            self.platform.quit();
+        }
+    }
+
+    /// Lets a host defer a quit before teardown begins, for example while it
+    /// asks about unsaved documents. Returning false leaves the app running.
+    /// The guard must not synchronously borrow the App or recursively quit;
+    /// enqueue a host command if a dialog is needed. No guard means allow.
+    pub fn set_quit_guard(&mut self, guard: impl Fn() -> bool + 'static) {
+        *self.quit_guard.borrow_mut() = Some(Rc::new(guard));
     }
 
     /// Switches the platform between headless and windowed modes.
@@ -3122,16 +3157,61 @@ impl App {
 
     /// Remove an asset from GPUI's cache
     pub fn remove_asset<A: Asset>(&mut self, source: &A::Source) {
-        let asset_id = (TypeId::of::<A>(), hash(source));
+        let asset_id = (TypeId::of::<A>(), A::cache_key(source, self));
         self.loading_assets.remove(&asset_id);
+    }
+
+    pub(crate) fn prune_image_assets(&mut self) {
+        // Drop animations first: each one owns its still source.
+        self.loading_assets.retain(|(kind, _), entry| {
+            if *kind != TypeId::of::<crate::ImageAnimationLoader>() { return true; }
+            let Some(load) = entry.downcast_ref::<crate::ImageLoad>() else { return true; };
+            load.is_shared() || load.get().is_some_and(|result| {
+                result.is_ok_and(|image| Arc::strong_count(&image) > 2)
+            })
+        });
+        let mut idle = Vec::new();
+        self.loading_assets.retain(|key, entry| {
+            if key.0 != TypeId::of::<crate::ImgResourceLoader>() { return true; }
+            let Some(load) = entry.downcast_ref::<crate::ImageLoad>() else { return true; };
+            if load.is_shared() { return true; }
+            match load.get() {
+                Some(Ok(image)) if Arc::strong_count(&image) > 2 => true,
+                Some(Ok(image)) if !self.windows.is_empty() => {
+                    idle.push((*key, self.image_asset_recency.get(key).copied().unwrap_or(0), image.cache_bytes()));
+                    true
+                }
+                _ => false,
+            }
+        });
+        // Enough for the three large backgrounds, including encoded sources, without
+        // letting a history of layouts retain unbounded decoded pixels.
+        idle.sort_unstable_by_key(|(_, recency, _)| std::cmp::Reverse(*recency));
+        let mut bytes = 0usize;
+        for (index, (key, _, size)) in idle.into_iter().enumerate() {
+            if bytes.saturating_add(size) > 128 * 1024 * 1024 || index >= 128 {
+                self.loading_assets.remove(&key);
+            } else {
+                bytes += size;
+            }
+        }
+        self.image_asset_recency.retain(|key, _| self.loading_assets.contains_key(key));
     }
 
     /// Check whether an asset is present in GPUI's cache (loading or loaded),
     /// without fetching it.
     #[cfg(any(test, feature = "test-support"))]
     pub fn has_asset<A: Asset>(&self, source: &A::Source) -> bool {
-        let asset_id = (TypeId::of::<A>(), hash(source));
+        let asset_id = (TypeId::of::<A>(), A::cache_key(source, self));
         self.loading_assets.contains_key(&asset_id)
+    }
+
+    /// Return a completed cached asset without starting a load.
+    pub fn cached_asset<A: Asset>(&self, source: &A::Source) -> Option<A::Output> {
+        let asset_id = (TypeId::of::<A>(), A::cache_key(source, self));
+        self.loading_assets.get(&asset_id)
+            .and_then(|entry| entry.downcast_ref::<CachedLoad<A::Output>>())
+            .and_then(CachedLoad::get)
     }
 
     /// Starts loading an uncached asset and returns its result once available.
@@ -3143,10 +3223,16 @@ impl App {
     }
 
     pub(crate) fn asset_entry<A: Asset>(&mut self, source: &A::Source) -> &CachedLoad<A::Output> {
-        let asset_id = (TypeId::of::<A>(), hash(source));
+        let asset_id = (TypeId::of::<A>(), A::cache_key(source, self));
+        if TypeId::of::<A>() == TypeId::of::<crate::ImgResourceLoader>() {
+            self.image_asset_clock += 1;
+            self.image_asset_recency.insert(asset_id, self.image_asset_clock);
+        }
         if !self.loading_assets.contains_key(&asset_id) {
             let future = A::load(source.clone(), self);
-            let entry = CachedLoad::new(future, self);
+            let refresh = TypeId::of::<A>() == TypeId::of::<crate::ImageAnimationLoader>()
+                || TypeId::of::<A>() == TypeId::of::<crate::ImgResourceLoader>();
+            let entry = CachedLoad::new_with_refresh(future, self, refresh);
             self.loading_assets.insert(asset_id, Box::new(entry));
         }
         self.loading_assets
@@ -3291,6 +3377,8 @@ impl App {
                         true
                     });
 
+                    drop(window);
+                    cx.prune_image_assets();
                     let quit_on_empty = match cx.quit_mode {
                         QuitMode::Explicit => false,
                         QuitMode::LastWindowClosed => true,

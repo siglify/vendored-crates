@@ -1,4 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 
 use std::{
     cell::{Cell, RefCell},
@@ -1043,7 +1044,7 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(feature = "test-support", feature = "render-to-image"))]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
         self.state
             .renderer

@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 //! Opt-in headless observation built exclusively on public GPUI APIs.
 //!
 //! Native accessibility properties are read automatically. Applications register
@@ -160,7 +161,7 @@ pub fn find(window: &Window, scope: &[ElementId], id: &ElementId) -> Option<Elem
 pub fn find_all(window: &Window, scope: &[ElementId], id: &ElementId) -> Vec<ElementSnapshot> {
     let mut matches: Vec<_> = REGISTRY.with(|registry| {
         let registry = registry.borrow();
-        let Some(entries) = registry.get(&(std::sync::Arc::as_ptr(window.text_system()) as usize))
+        let Some(entries) = registry.get(&(std::rc::Rc::as_ptr(window.text_system()) as usize))
         else {
             return Vec::new();
         };
@@ -184,7 +185,7 @@ pub fn snapshots(window: &Window) -> Vec<ElementSnapshot> {
     REGISTRY.with(|registry| {
         registry
             .borrow()
-            .get(&(std::sync::Arc::as_ptr(window.text_system()) as usize))
+            .get(&(std::rc::Rc::as_ptr(window.text_system()) as usize))
             .map(|entries| {
                 entries
                     .values()
@@ -331,7 +332,7 @@ impl<E: Element<PrepaintState = Option<Hitbox>> + InteractiveElement> Element fo
             window.with_element_state(global_id, |state: Option<Rc<Registration>>, window| {
                 let registration = state.unwrap_or_else(|| {
                     Rc::new(Registration {
-                        window: std::sync::Arc::as_ptr(window.text_system()) as usize,
+                        window: std::rc::Rc::as_ptr(window.text_system()) as usize,
                         global_id: global_id.clone(),
                         facts: RefCell::new(facts.clone()),
                     })

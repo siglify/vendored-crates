@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 use std::{
     borrow::Cow,
     ffi::{c_uint, c_void},
@@ -138,6 +139,22 @@ impl PlatformTextSystem for DirectWriteTextSystem {
             RwLockUpgradableReadGuard::upgrade(lock)
                 .select_and_cache_font(&self.components, font)
                 .with_context(|| format!("Failed to select font: {:?}", font))
+        }
+    }
+
+    fn font_table(&self, font_id: FontId, tag: [u8; 4]) -> Option<Vec<u8>> {
+        let state = self.state.read();
+        let face = &state.fonts[font_id.0].font_face;
+        unsafe {
+            let mut data = std::ptr::null_mut();
+            let mut len = 0;
+            let mut context = std::ptr::null_mut();
+            let mut exists = Default::default();
+            face.TryGetFontTable(u32::from_le_bytes(tag), &mut data, &mut len, &mut context, &mut exists).ok()?;
+            if !exists.as_bool() { return None; }
+            let table = std::slice::from_raw_parts(data.cast::<u8>(), len as usize).to_vec();
+            face.ReleaseFontTable(context);
+            Some(table)
         }
     }
 
@@ -818,7 +835,7 @@ impl DirectWriteState {
                 .GetGlyphIndices(&raw const codepoints, 1, &raw mut glyph_indices)
                 .log_err()
         }
-        .map(|_| GlyphId(glyph_indices as u32))
+        .and_then(|_| (glyph_indices != 0).then_some(GlyphId(glyph_indices as u32)))
     }
 
     fn rasterize_glyph(
@@ -1803,6 +1820,21 @@ mod tests {
     use gpui::{Font, FontWeight, PlatformTextSystem, TextRun, TextSystem, WindowTextSystem, px};
     use std::sync::Arc;
     use windows::Win32::Graphics::DirectWrite::{DWRITE_FONT_STRETCH_NORMAL, DWRITE_TEXT_METRICS};
+
+    #[test]
+    fn missing_characters_have_no_glyph() -> Result<()> {
+        let text_system = DirectWriteTextSystem::new()?;
+        let font_id = text_system.font_id(&Font {
+            family: "Consolas".into(),
+            ..Default::default()
+        })?;
+
+        assert!(text_system.glyph_for_char(font_id, 'M').is_some());
+        for ch in ['\u{f115}', '\u{f090}', '\u{f08b}', '\u{10ffff}'] {
+            assert_eq!(text_system.glyph_for_char(font_id, ch), None);
+        }
+        Ok(())
+    }
 
     #[test]
     fn tabs_preserve_native_advances_and_cursor() -> Result<()> {

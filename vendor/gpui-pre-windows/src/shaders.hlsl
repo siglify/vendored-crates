@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 #include "alpha_correction.hlsl"
 
 cbuffer GlobalParams: register(b0) {
@@ -554,6 +555,34 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
     output.background_color1 = gradient.color1;
     output.clip_distance = clip_distance;
     return output;
+}
+
+// SIGLIFY: a quad with a solid background, no border and no rounding (most
+// backgrounds and panels). It skips `quad_fragment`, which WARP (software
+// D3D) runs in full for every pixel whatever branch the pixel takes.
+struct PlainQuadVertexOutput {
+    float4 position: SV_Position;
+    nointerpolation float4 color: COLOR0;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct PlainQuadFragmentInput {
+    float4 position: SV_Position;
+    nointerpolation float4 color: COLOR0;
+};
+
+PlainQuadVertexOutput plain_quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    Quad quad = quads[batch_start_index + instance_id];
+    PlainQuadVertexOutput output;
+    output.position = to_device_position(unit_vertex, quad.bounds);
+    output.color = hsla_to_rgba(quad.background.solid);
+    output.clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    return output;
+}
+
+float4 plain_quad_fragment(PlainQuadFragmentInput input): SV_Target {
+    return input.color;
 }
 
 float4 quad_fragment(QuadFragmentInput input): SV_Target {

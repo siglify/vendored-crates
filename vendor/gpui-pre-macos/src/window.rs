@@ -1,7 +1,9 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 use crate::{
     BoolExt, MacDisplay, MetalFrames, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
-    kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
+    kTISPropertyInputSourceType, kTISTypeKeyboardInputMethodModeEnabled,
+    kTISTypeKeyboardInputMethodWithoutModes, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
 use anyhow::Result;
@@ -16,12 +18,11 @@ use gpui::{
     SharedString, Size, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControlArea, WindowKind, WindowParams, WindowVisibility, point, px, size,
 };
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "render-to-image"))]
 use image::RgbaImage;
 
 use core_foundation::base::{CFRelease, CFTypeRef};
 use core_foundation_sys::base::CFEqual;
-use core_foundation_sys::number::{CFBooleanGetValue, CFBooleanRef};
 use core_graphics::display::CGDirectDisplayID;
 use ctor::ctor;
 use futures::channel::oneshot;
@@ -1899,7 +1900,25 @@ impl PlatformWindow for MacWindow {
             };
             let _: () = msg_send![this.native_window, setBackgroundColor: &*background_color];
 
-            if background_appearance != WindowBackgroundAppearance::Blurred {
+            // From macOS 26 Liquid Glass rebuilt the layers under NSVisualEffectView, so the
+            // view below no longer blurs: the window turns see-through without frost. Ask the
+            // window server for the blur directly there instead.
+            if is_macos_version_at_least(NSOperatingSystemVersion {
+                majorVersion: 26,
+                minorVersion: 0,
+                patchVersion: 0,
+            }) {
+                let blurred = background_appearance == WindowBackgroundAppearance::Blurred;
+                let window_number: NSInteger = msg_send![this.native_window, windowNumber];
+                CGSSetWindowBackgroundBlurRadius(
+                    CGSMainConnectionID(),
+                    window_number,
+                    if blurred { WINDOW_SERVER_BLUR_RADIUS } else { 0 },
+                );
+                if let Some(blur_view) = this.blurred_view.take() {
+                    let _: () = msg_send![blur_view, removeFromSuperview];
+                }
+            } else if background_appearance != WindowBackgroundAppearance::Blurred {
                 if let Some(blur_view) = this.blurred_view {
                     let _: () = msg_send![blur_view, removeFromSuperview];
                     this.blurred_view = None;
@@ -2397,7 +2416,7 @@ impl PlatformWindow for MacWindow {
         NSBeep()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support", feature = "render-to-image"))]
     fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
         let mut this = self.0.lock();
         this.renderer.render_to_image(scene)
@@ -2660,15 +2679,8 @@ extern "C" fn handle_key_up(this: &AnyObject, _: Sel, native_event: *mut AnyObje
 //   - In vim mode with `jj` bound to `vim::NormalBefore` in insert mode, typing 'j i' with
 //     Japanese IME should produce "じ" (ji), not "jい"
 
-/// Returns true if the current keyboard input source is a composition-based IME
-/// (e.g. Japanese Hiragana, Korean, Chinese Pinyin) that produces non-ASCII output.
-///
-/// This checks two properties:
-/// 1. The source type is `kTISTypeKeyboardInputMode` (an IME input mode, not a plain
-///    keyboard layout). This excludes non-ASCII layouts like Armenian and Ukrainian
-///    that map keys directly without composition.
-/// 2. The source is not ASCII-capable, which excludes modes like Japanese Romaji that
-///    produce ASCII characters and should allow multi-stroke keybindings like `jj`.
+/// IMEs can compose even when ASCII-capable (e.g. Vietnamese Telex). Plain
+/// keyboard layouts, including non-ASCII ones, don't need composition routing.
 unsafe fn is_ime_input_source_active() -> bool {
     unsafe {
         let source = TISCopyCurrentKeyboardInputSource();
@@ -2678,21 +2690,16 @@ unsafe fn is_ime_input_source_active() -> bool {
 
         let source_type =
             TISGetInputSourceProperty(source, kTISPropertyInputSourceType as *const c_void);
-        let is_input_mode = !source_type.is_null()
-            && CFEqual(
-                source_type as CFTypeRef,
-                kTISTypeKeyboardInputMode as CFTypeRef,
-            ) != 0;
-
-        let is_ascii = TISGetInputSourceProperty(
-            source,
-            kTISPropertyInputSourceIsASCIICapable as *const c_void,
-        );
-        let is_ascii_capable = !is_ascii.is_null() && CFBooleanGetValue(is_ascii as CFBooleanRef);
+        let is_input_method = !source_type.is_null()
+            && [
+                kTISTypeKeyboardInputMode,
+                kTISTypeKeyboardInputMethodWithoutModes,
+                kTISTypeKeyboardInputMethodModeEnabled,
+            ].iter().any(|kind| CFEqual(source_type as CFTypeRef, *kind as CFTypeRef) != 0);
 
         CFRelease(source as CFTypeRef);
 
-        is_input_mode && !is_ascii_capable
+        is_input_method
     }
 }
 
@@ -2735,6 +2742,14 @@ extern "C" fn handle_key_event(
             }
 
             drop(lock);
+
+            // Alt shortcuts must never enter AppKit's Option/dead-key composition.
+            if key_down_event.keystroke.modifiers.alt
+                && !key_down_event.keystroke.modifiers.platform
+                && crate::events::option_as_alt().uses_alt(key_down_event.keystroke.option_side)
+            {
+                return run_callback(PlatformInput::KeyDown(key_down_event));
+            }
 
             let is_composing =
                 with_input_handler(this, |input_handler| input_handler.marked_text_range())
@@ -3930,6 +3945,19 @@ fn display_id_for_screen(screen: *mut AnyObject) -> Option<CGDirectDisplayID> {
         let screen_number: NSUInteger = msg_send![screen_number, unsignedIntegerValue];
         Some(screen_number as CGDirectDisplayID)
     }
+}
+
+/// How far the window server blurs the desktop behind a blurred window (macOS 26+).
+const WINDOW_SERVER_BLUR_RADIUS: i64 = 50;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGSMainConnectionID() -> *mut c_void;
+    fn CGSSetWindowBackgroundBlurRadius(
+        connection_id: *mut c_void,
+        window_id: isize,
+        radius: i64,
+    ) -> i32;
 }
 
 extern "C" fn blurred_view_init_with_frame(

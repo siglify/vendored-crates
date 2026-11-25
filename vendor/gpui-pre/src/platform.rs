@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 mod app_menu;
 mod keyboard;
 mod keystroke;
@@ -51,7 +52,7 @@ use anyhow::{Context as _, Result};
 use async_task::Runnable;
 use collections::FxHashMap;
 use futures::channel::oneshot;
-#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+#[cfg(any(test, feature = "test-support", feature = "bench-support", feature = "render-to-image"))]
 use image::RgbaImage;
 use image::codecs::{gif::GifDecoder, webp::WebPDecoder};
 use image::{DynamicImage, Frame, Rgba};
@@ -169,6 +170,8 @@ pub enum ActivationPolicy {
     Regular,
     /// Run without foreground application UI while retaining the ability to open windows.
     Accessory,
+    /// Never activate or show foreground application UI (for command-line checks).
+    Prohibited,
 }
 
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
@@ -460,6 +463,9 @@ pub trait Platform: 'static {
     fn reveal_path(&self, path: &Path);
     fn open_with_system(&self, path: &Path);
 
+    /// Optional early veto for native quit requests. The ordinary on_quit
+    /// callback still performs shutdown only after the request is accepted.
+    fn on_quit_requested(&self, _callback: Box<dyn Fn() -> bool>) {}
     fn on_quit(&self, callback: Box<dyn FnMut() -> bool>);
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
     /// Registers the callback invoked when the system is about to sleep.
@@ -1454,7 +1460,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Renders the given scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support", feature = "render-to-image"))]
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
@@ -1555,6 +1561,8 @@ pub trait PlatformTextSystem: Send + Sync {
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
     /// Prewarm any system font caches needed to shape text.
     fn prewarm_fonts(&self, _font_ids: &[FontId]) {}
+    /// SIGLIFY: Read an OpenType table from the selected face for terminal metrics.
+    fn font_table(&self, _font_id: FontId, _tag: [u8; 4]) -> Option<Vec<u8>> { None }
     /// Get metrics for a font.
     fn font_metrics(&self, font_id: FontId) -> FontMetrics;
     /// Get typographic bounds for a glyph.
@@ -1563,6 +1571,10 @@ pub trait PlatformTextSystem: Send + Sync {
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>>;
     /// Get the glyph ID for a character.
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId>;
+    /// Whether this backend's color glyph pixels depend on the run foreground.
+    fn glyph_uses_foreground(&self, _params: &RenderGlyphParams) -> bool {
+        false
+    }
     /// Get raster bounds for a glyph.
     fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>>;
     /// Rasterize a glyph.
@@ -1802,6 +1814,8 @@ pub trait PlatformAtlas {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
+    /// Remove every cached size of SVG assets at or beneath this path.
+    fn remove_svg(&self, path: &str);
 
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
@@ -1878,6 +1892,18 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
             self.backend.remove(tile);
         }
     }
+
+    /// Remove SVGs at or beneath this path, releasing all their atlas tiles.
+    pub fn remove_svg(&mut self, path: &str) {
+        self.tiles_by_key.retain(|key, tile| {
+            if matches!(key, AtlasKey::Svg(params) if std::path::Path::new(params.path.as_ref()).starts_with(path)) {
+                self.backend.remove(*tile);
+                false
+            } else {
+                true
+            }
+        });
+    }
 }
 
 /// A sprite atlas for windows without a GPU. It hands out uniquely identified
@@ -1931,6 +1957,10 @@ impl PlatformAtlas for HeadlessAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
+    }
+
+    fn remove_svg(&self, path: &str) {
+        self.0.lock().remove_svg(path);
     }
 
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]

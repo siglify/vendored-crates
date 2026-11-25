@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 use crate::{
     AppleActivity, AppleDispatcher, BoolExt, MacDisplay, MacKeyboardLayout, MacKeyboardMapper,
     MacWindow, events::key_to_menu_equivalent, main_thread_marker, ns_string,
@@ -86,6 +87,10 @@ unsafe fn build_classes() {
             decl.add_method(
                 sel!(applicationShouldHandleReopen:hasVisibleWindows:),
                 should_handle_reopen as extern "C-unwind" fn(_, Sel, *mut AnyObject, Bool) -> Bool,
+            );
+            decl.add_method(
+                sel!(applicationShouldTerminate:),
+                should_terminate as extern "C-unwind" fn(_, Sel, *mut AnyObject) -> usize,
             );
             decl.add_method(
                 sel!(applicationWillTerminate:),
@@ -182,6 +187,7 @@ pub(crate) struct MacPlatformState {
     on_system_wake: Option<Box<dyn FnMut()>>,
     system_power_observers_registered: bool,
     quit: Option<Box<dyn FnMut() -> bool>>,
+    quit_requested: Option<Box<dyn Fn() -> bool>>,
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     will_open_menu: Option<Box<dyn FnMut()>>,
@@ -209,6 +215,7 @@ fn native_activation_policy(policy: ActivationPolicy) -> NSApplicationActivation
     match policy {
         ActivationPolicy::Regular => NSApplicationActivationPolicy::Regular,
         ActivationPolicy::Accessory => NSApplicationActivationPolicy::Accessory,
+        ActivationPolicy::Prohibited => NSApplicationActivationPolicy::Prohibited,
     }
 }
 
@@ -245,6 +252,7 @@ impl MacPlatform {
             find_pasteboard: Pasteboard::find(),
             reopen: None,
             quit: None,
+            quit_requested: None,
             menu_command: None,
             validate_menu_command: None,
             will_open_menu: None,
@@ -537,16 +545,16 @@ impl Platform for MacPlatform {
 
         unsafe {
             let app: *mut AnyObject = msg_send![APP_CLASS, sharedApplication];
-            // An accessory app must not register in the Dock during launch, so its
-            // policy has to precede the run loop. `Regular` is applied in
-            // `did_finish_launching` instead: setting it this early leaves the menu
-            // bar of an unbundled app launched from a terminal unclickable.
+            // Non-foreground policies must precede the run loop so CLI checks
+            // never launch as a foreground app. `Regular` is applied in
+            // `did_finish_launching`: setting it this early leaves the menu bar
+            // of an unbundled app launched from a terminal unclickable.
             let policy = {
                 let mut state = self.0.lock();
                 state.application_created = true;
                 state.activation_policy
             };
-            if policy == ActivationPolicy::Accessory {
+            if policy != ActivationPolicy::Regular {
                 let _: Bool = msg_send![app, setActivationPolicy: native_activation_policy(policy)];
             }
             let app_delegate: *mut AnyObject = msg_send![APP_DELEGATE_CLASS, new];
@@ -1037,6 +1045,10 @@ impl Platform for MacPlatform {
             .detach();
     }
 
+    fn on_quit_requested(&self, callback: Box<dyn Fn() -> bool>) {
+        self.0.lock().quit_requested = Some(callback);
+    }
+
     fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
         self.0.lock().quit = Some(callback);
     }
@@ -1388,6 +1400,17 @@ extern "C-unwind" fn should_handle_reopen(
     Bool::YES
 }
 
+// applicationWillTerminate is too late to keep an unsaved document alive.
+// NSTerminateCancel = 0; NSTerminateNow = 1.
+extern "C-unwind" fn should_terminate(this: &AnyObject, _: Sel, _: *mut AnyObject) -> usize {
+    let platform = unsafe { get_mac_platform(this) };
+    let callback = platform.0.lock().quit_requested.take();
+    let Some(callback) = callback else { return 1; };
+    let allow = callback();
+    platform.0.lock().quit_requested = Some(callback);
+    usize::from(allow)
+}
+
 extern "C-unwind" fn will_terminate(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     let platform = unsafe { get_mac_platform(this) };
     let mut lock = platform.0.lock();
@@ -1626,7 +1649,8 @@ unsafe extern "C" {
     pub(super) static kTISPropertyUnicodeKeyLayoutData: CFStringRef;
     pub(super) static kTISPropertyInputSourceID: CFStringRef;
     pub(super) static kTISPropertyLocalizedName: CFStringRef;
-    pub(super) static kTISPropertyInputSourceIsASCIICapable: CFStringRef;
     pub(super) static kTISPropertyInputSourceType: CFStringRef;
     pub(super) static kTISTypeKeyboardInputMode: CFStringRef;
+    pub(super) static kTISTypeKeyboardInputMethodWithoutModes: CFStringRef;
+    pub(super) static kTISTypeKeyboardInputMethodModeEnabled: CFStringRef;
 }

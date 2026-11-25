@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 //! Builds libghostty-vt from vendor/ghostty with Zig and generates bindings from its headers.
 
 use std::path::PathBuf;
@@ -32,6 +33,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ZIG");
 
     let zig = std::env::var("ZIG").unwrap_or_else(|_| "zig".into());
+    // Packages whose only host (codeberg.org) goes down: seed Zig's cache from the copies here,
+    // so the build doesn't download them. Zig matches them by the hash in build.zig.zon.
+    for file in std::fs::read_dir(manifest.join("zig-packages")).unwrap() {
+        let file = file.unwrap().path();
+        println!("cargo:rerun-if-changed={}", file.display());
+        let status = Command::new(&zig).current_dir(&src).arg("fetch").arg(&file).stdout(std::process::Stdio::null()).status();
+        assert!(status.is_ok_and(|s| s.success()), "zig fetch {} failed", file.display());
+    }
     let status = Command::new(&zig)
         .current_dir(&src)
         // Only the static library is linked. Ghostty builds the xcframework whenever it finds

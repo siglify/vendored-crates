@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 use anyhow::anyhow;
 use collections::{HashMap, HashSet};
 use core_foundation::{
@@ -177,6 +178,11 @@ impl PlatformTextSystem for AppleTextSystem {
             lock.font_selections.insert(font.clone(), font_id);
             Ok(font_id)
         }
+    }
+
+    // SIGLIFY: OpenType tables for terminal metrics (moved here from gpui-pre-macos).
+    fn font_table(&self, font_id: FontId, tag: [u8; 4]) -> Option<Vec<u8>> {
+        self.0.read().fonts[font_id.0].load_font_table(u32::from_be_bytes(tag)).map(Vec::from)
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {

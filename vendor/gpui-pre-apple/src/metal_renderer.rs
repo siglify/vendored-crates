@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
@@ -5,7 +6,7 @@ use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
     PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
-#[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+#[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "render-to-image"))]
 use image::RgbaImage;
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_core_foundation::{CFRetained, CGSize};
@@ -13,7 +14,7 @@ use objc2_core_graphics::{CGColorSpace, kCGColorSpaceDisplayP3};
 use objc2_core_video::{
     CVMetalTexture, CVMetalTextureCache, CVMetalTextureGetTexture, CVPixelBufferGetHeight,
     CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
-    CVPixelBufferGetWidthOfPlane, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVReturnSuccess,
+    CVPixelBufferGetWidthOfPlane, kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVReturnSuccess,
 };
 use objc2_foundation::{NSRange, NSString};
 #[cfg(target_os = "macos")]
@@ -26,7 +27,7 @@ use objc2_metal::{
     MTLRenderPipelineState, MTLResourceOptions, MTLStorageMode, MTLStoreAction, MTLTexture,
     MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLViewport,
 };
-#[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+#[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "render-to-image"))]
 use objc2_metal::{MTLBlitCommandEncoder, MTLOrigin, MTLRegion, MTLSize};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use parking_lot::Mutex;
@@ -143,6 +144,8 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     polychrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     surfaces_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    // SIGLIFY: BGRA surfaces (an embedded browser's IOSurface), drawn without conversion.
+    bgra_surfaces_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
@@ -393,6 +396,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         )?;
+        let bgra_surfaces_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "bgra_surfaces",
+            "surface_vertex",
+            "bgra_surface_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        )?;
 
         let command_queue = device.newCommandQueue().context("creating command queue")?;
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
@@ -431,6 +442,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            bgra_surfaces_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -706,7 +718,7 @@ impl MetalRenderer {
     ///
     /// Note: This requires a layer-backed renderer. For headless rendering,
     /// use `render_scene_to_image()` instead.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support", feature = "render-to-image"))]
     pub fn render_to_image(&mut self, scene: &Scene) -> Result<RgbaImage> {
         let layer = self
             .layer
@@ -745,7 +757,7 @@ impl MetalRenderer {
 
     /// Renders a scene into a new offscreen texture of `size` and reads it
     /// back, without presenting anything.
-    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+    #[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "render-to-image"))]
     fn render_offscreen(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<RgbaImage> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             anyhow::bail!("Invalid size for render_offscreen: {:?}", size);
@@ -787,6 +799,12 @@ impl MetalRenderer {
 
         command_buffer.commit();
         command_buffer.waitUntilCompleted();
+        // SIGLIFY: a failed GPU command buffer must not read back as a valid screenshot.
+        anyhow::ensure!(
+            command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Completed,
+            "GPU did not complete screenshot rendering: {:?}",
+            command_buffer.status()
+        );
 
         read_texture_to_image(&target_texture)
     }
@@ -1409,10 +1427,16 @@ impl MetalRenderer {
             );
 
             let pixel_format = CVPixelBufferGetPixelFormatType(image_buffer);
+            let bgra = pixel_format == kCVPixelFormatType_32BGRA;
             anyhow::ensure!(
-                pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                bgra || pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
                 "unsupported surface pixel format: {pixel_format:#x}"
             );
+            command_encoder.setRenderPipelineState(if bgra {
+                &self.bgra_surfaces_pipeline_state
+            } else {
+                &self.surfaces_pipeline_state
+            });
 
             let plane_texture = |plane, format| -> Result<CFRetained<CVMetalTexture>> {
                 let width = CVPixelBufferGetWidthOfPlane(image_buffer, plane);
@@ -1441,6 +1465,46 @@ impl MetalRenderer {
                 // SAFETY: The successful create call transfers ownership of this non-null texture.
                 Ok(unsafe { CFRetained::from_raw(texture) })
             };
+            if bgra {
+                let mut texture = ptr::null_mut();
+                // SAFETY: A non-planar BGRA buffer is one texture of the buffer's size; the output pointer is writable.
+                let status = unsafe {
+                    CVMetalTextureCache::create_texture_from_image(
+                        None,
+                        &self.core_video_texture_cache,
+                        image_buffer,
+                        None,
+                        MTLPixelFormat::BGRA8Unorm,
+                        CVPixelBufferGetWidth(image_buffer),
+                        CVPixelBufferGetHeight(image_buffer),
+                        0,
+                        ptr::NonNull::from(&mut texture),
+                    )
+                };
+                anyhow::ensure!(status == kCVReturnSuccess, "creating CoreVideo Metal texture: status {status}");
+                let texture = ptr::NonNull::new(texture).context("retrieving CoreVideo Metal texture")?;
+                // SAFETY: The successful create call transfers ownership of this non-null texture.
+                let texture: CFRetained<CVMetalTexture> = unsafe { CFRetained::from_raw(texture) };
+                let metal_texture = CVMetalTextureGetTexture(&texture).context("retrieving BGRA Metal texture")?;
+                // SAFETY: As for the YCbCr planes below; the BGRA texture uses the luma slot.
+                unsafe {
+                    command_encoder.setVertexBytes_length_atIndex(
+                        ptr::NonNull::from(&texture_size).cast(),
+                        mem::size_of_val(&texture_size),
+                        SurfaceInputIndex::TextureSize as usize,
+                    );
+                    command_encoder.setFragmentTexture_atIndex(Some(&metal_texture), SurfaceInputIndex::YTexture as usize);
+                    command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                        MTLPrimitiveType::Triangle,
+                        0,
+                        6,
+                        1,
+                        first_surface + index,
+                    );
+                }
+                surface_textures.push(texture);
+                continue;
+            }
             let y_texture = plane_texture(0, MTLPixelFormat::R8Unorm)?;
             let cb_cr_texture = plane_texture(1, MTLPixelFormat::RG8Unorm)?;
             let y_metal_texture =
@@ -1518,7 +1582,7 @@ fn new_command_encoder_for_texture(
     Ok(command_encoder)
 }
 
-#[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+#[cfg(any(test, feature = "bench-support", feature = "test-support", feature = "render-to-image"))]
 fn read_texture_to_image(texture: &ProtocolObject<dyn MTLTexture>) -> Result<RgbaImage> {
     let width = texture.width() as u32;
     let height = texture.height() as u32;

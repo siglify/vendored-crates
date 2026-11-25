@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 //! Cranelift lowering and W^X publication for Tier 1 pure frame operations.
 
 use std::{
@@ -1982,6 +1983,7 @@ pub struct RelocatableCode {
     target: Triple,
     host_publishable: bool,
     clif: String,
+    #[allow(dead_code)]
     machine_disassembly: Option<String>,
     osr_codes: Vec<(crate::runtime::OsrMap, RelocatableCode)>,
 }

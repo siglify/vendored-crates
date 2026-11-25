@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 use anyhow::{Context as _, Result, ensure};
 use etagere::BucketedAtlasAllocator;
 use gpui::{
@@ -57,6 +58,10 @@ impl PlatformAtlas for MetalAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
+    }
+
+    fn remove_svg(&self, path: &str) {
+        self.0.lock().remove_svg(path);
     }
 }
 

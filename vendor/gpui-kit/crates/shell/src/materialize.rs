@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 //! Turns element descriptions into real GPUI elements.
 //!
 //! This runs entirely in Rust: it never calls back into the script, which is what
@@ -1887,7 +1888,7 @@ where
         if let Some(callback) = behavior.on_scroll_wheel {
             let runtime = Rc::downgrade(runtime);
             let bounds = Rc::clone(&bounds);
-            element = element.on_scroll_wheel(move |event, window, cx| {
+            element = element.on_scroll(move |event, window, cx| {
                 let Some(runtime) = runtime.upgrade() else {
                     return;
                 };

@@ -1,0 +1,10 @@
+# The workspace settings the crates here inherit; siglify-app uses them as git dependencies.
+[workspace]
+members = ["crates/ghostty-sys"]
+exclude = ["vendor/gpui-kit", "vendor/gpui-pre", "vendor/gpui-pre-wgpu", "vendor/gpui-pre-apple", "vendor/gpui-pre-linux", "vendor/gpui-pre-macos", "vendor/gpui-pre-windows", "vendor/quickjs-jit-runtime", "vendor/zed-xim", "vendor/xim-ctext"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+publish = false

@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 //! Hot reload: watching an application directory and rebuilding its view.
 //!
 //! The design (`docs/gpui-shell.md` §21.2) is a five step pipeline:
@@ -317,6 +318,7 @@ impl Watcher {
     ///
     /// The watcher holds the runtime and view weakly, so it cannot keep an
     /// unmounted application alive.
+    #[cfg(test)]
     pub(crate) fn start(
         runtime: &Rc<ShellRuntime>,
         view: &Entity<ScriptView>,
@@ -324,6 +326,18 @@ impl Watcher {
         entry: impl Into<String>,
         window: &mut Window,
         cx: &mut App,
+    ) -> Result<Self> {
+        Self::start_guarded(runtime, view, directory, entry, window, cx, None)
+    }
+
+    fn start_guarded(
+        runtime: &Rc<ShellRuntime>,
+        view: &Entity<ScriptView>,
+        directory: PathBuf,
+        entry: impl Into<String>,
+        window: &mut Window,
+        cx: &mut App,
+        guard: Option<Rc<dyn Fn(&mut Window, &mut App) -> bool>>,
     ) -> Result<Self> {
         if !Rc::ptr_eq(&view.read(cx).runtime(), runtime) {
             bail!("this ScriptView belongs to a different gpui-shell runtime");
@@ -335,6 +349,7 @@ impl Watcher {
         let view = view.downgrade();
 
         let task = cx.spawn(async move |cx| {
+            let mut pending_reload = false;
             loop {
                 cx.background_executor().timer(POLL_INTERVAL).await;
 
@@ -368,11 +383,11 @@ impl Watcher {
                     }
                 };
 
-                if !changed {
-                    continue;
-                }
+                pending_reload |= changed;
+                if !pending_reload { continue; }
 
                 let reached = handle.update(cx, |_, window, cx| {
+                    if guard.as_ref().is_some_and(|guard| !guard(window, cx)) { return false; }
                     match reload(&runtime, &view, &directory, &entry, window, cx) {
                         Ok(()) => {
                             tracing::info!("reloaded {}", directory.display());
@@ -386,10 +401,13 @@ impl Watcher {
                             report_failure(handle, &message, window, cx);
                         }
                     }
+                    true
                 });
 
-                if reached.is_err() {
-                    break;
+                match reached {
+                    Ok(true) => pending_reload = false,
+                    Ok(false) => {}, // Retry once the owner permits replacement.
+                    Err(_) => break,
                 }
             }
         });
@@ -422,6 +440,19 @@ impl ShellRuntime {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<Watcher> {
+        self.watch_guarded(root, window, cx, |_, _| true)
+    }
+
+    /// Watches the same files as `watch`, but lets the owner defer replacement.
+    /// A rejected change remains pending and is retried on the next poll, even
+    /// if the source has not changed again. The callback runs outside render.
+    pub fn watch_guarded(
+        self: &Rc<Self>,
+        root: &Entity<ShellRoot>,
+        window: &mut Window,
+        cx: &mut App,
+        guard: impl Fn(&mut Window, &mut App) -> bool + 'static,
+    ) -> Result<Watcher> {
         let (view, application_root, entry) = {
             let root = root.read(cx);
             let application = root
@@ -436,7 +467,7 @@ impl ShellRuntime {
         if !Rc::ptr_eq(&view.read(cx).runtime(), self) {
             bail!("this ShellRoot belongs to a different gpui-shell runtime");
         }
-        Watcher::start(self, &view, application_root, entry, window, cx)
+        Watcher::start_guarded(self, &view, application_root, entry, window, cx, Some(Rc::new(guard)))
     }
 
     /// HERDR: reloads the application now, for a host that watches its files

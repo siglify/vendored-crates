@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 #[cfg(feature = "profiler")]
 use crate::DebugFrameOverlayMode;
 #[cfg(any(feature = "inspector", debug_assertions))]
@@ -1227,6 +1228,10 @@ pub struct Window {
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
+    foreground_glyph_tiles: FxHashMap<RenderGlyphParams, (AtlasTile, Bounds<DevicePixels>)>,
+    image_tiles: FxHashMap<RenderImageParams, (AtlasTile, Option<Arc<RenderImage>>)>,
+    image_assets: FxHashMap<(TypeId, u64), crate::ImageLoad>,
+    accessed_image_assets: FxHashSet<(TypeId, u64)>,
     text_system: Rc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -1252,6 +1257,8 @@ pub struct Window {
     focused_text_input: Option<FocusId>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
+    // SIGLIFY: distinguish an empty scene from a window that has not drawn yet.
+    rendered_frame_size: Option<(Size<Pixels>, f32)>,
     pub(crate) next_frame: Frame,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
@@ -2358,6 +2365,10 @@ impl Window {
             is_resizable,
             is_minimizable,
             sprite_atlas,
+            foreground_glyph_tiles: FxHashMap::default(),
+            image_tiles: FxHashMap::default(),
+            image_assets: FxHashMap::default(),
+            accessed_image_assets: FxHashSet::default(),
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -2375,6 +2386,7 @@ impl Window {
             last_text_input_configuration: None,
             focused_text_input: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            rendered_frame_size: None,
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
@@ -3091,8 +3103,15 @@ impl Window {
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support", feature = "render-to-image"))]
     pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
+        anyhow::ensure!(self.rendered_frame_size.is_some(), "no window frame has been rendered yet");
+        anyhow::ensure!(
+            self.rendered_frame_size == Some((
+                self.platform_window.content_size(), self.platform_window.scale_factor()
+            )),
+            "window size or scale changed; wait for the next frame"
+        );
         self.platform_window
             .render_to_image(&self.rendered_frame.scene)
     }
@@ -3677,6 +3696,7 @@ impl Window {
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
+        self.accessed_image_assets.clear();
 
         // Restore the previously-used input handler.
         // Place it back into a None slot (left by a previous .take()) so that
@@ -3743,11 +3763,55 @@ impl Window {
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+        // Cached paint ranges can reuse image sprites without calling paint_image.
+        let current_image_tiles: FxHashSet<_> = self.next_frame.scene.polychrome_sprites.iter()
+            .map(|sprite| (sprite.tile.texture_id, sprite.tile.tile_id.0)).collect();
+        let mut live_image_tiles = current_image_tiles.clone();
+        live_image_tiles.extend(self.rendered_frame.scene.polychrome_sprites.iter()
+            .map(|sprite| (sprite.tile.texture_id, sprite.tile.tile_id.0)));
+        self.image_tiles.retain(|params, (tile, image)| {
+            let key = (tile.texture_id, tile.tile_id.0);
+            // An uploaded tile needs no CPU pixels while only the previous scene uses it.
+            if !current_image_tiles.contains(&key) { *image = None; }
+            if live_image_tiles.contains(&key) { true }
+            else { self.sprite_atlas.remove(&params.clone().into()); false }
+        });
+        let rendered_entities = cx.entities.take_accessed();
+        self.image_assets.retain(|key, load| {
+            self.accessed_image_assets.contains(key) || load.loading_for(&rendered_entities) || load.get().is_some_and(|result| {
+                result.is_ok_and(|image| self.image_tiles.iter().any(|(params, (tile, _))| {
+                    params.image_id == image.id && current_image_tiles.contains(&(tile.texture_id, tile.tile_id.0))
+                }))
+            })
+        });
+        cx.entities.restore_accessed(rendered_entities);
+        cx.prune_image_assets();
+        if !self.foreground_glyph_tiles.is_empty() {
+            // Cached paint ranges can reuse sprites without calling paint_emoji.
+            // Keep both live scenes; retire only variants neither scene references.
+            let live: FxHashSet<_> = self
+                .next_frame
+                .scene
+                .polychrome_sprites
+                .iter()
+                .chain(&self.rendered_frame.scene.polychrome_sprites)
+                .map(|sprite| (sprite.tile.texture_id, sprite.tile.tile_id.0))
+                .collect();
+            self.foreground_glyph_tiles.retain(|params, (tile, _)| {
+                if live.contains(&(tile.texture_id, tile.tile_id.0)) {
+                    true
+                } else {
+                    self.sprite_atlas.remove(&params.clone().into());
+                    false
+                }
+            });
+        }
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+        self.rendered_frame_size = Some((self.viewport_size, self.scale_factor));
         self.next_frame.clear();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
@@ -4538,6 +4602,23 @@ impl Window {
     pub fn get_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
         cx.fetch_asset::<A>(source)
     }
+    pub(crate) fn image_asset<A: Asset<Output = Result<Arc<RenderImage>, crate::ImageCacheError>>>(
+        &mut self,
+        source: &A::Source,
+        subscribe: bool,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, crate::ImageCacheError>> {
+        let key = (TypeId::of::<A>(), A::cache_key(source, cx));
+        let entry = cx.asset_entry::<A>(source);
+        self.image_assets.insert(key, entry.clone());
+        self.accessed_image_assets.insert(key);
+        if subscribe && let Some(view) = self.rendered_entity_stack.last().copied() {
+            entry.use_by(view)
+        } else {
+            entry.get()
+        }
+    }
+
     /// Obtain the current element offset. This method should only be called during the
     /// prepaint phase of element drawing.
     pub fn element_offset(&self) -> Point<Pixels> {
@@ -5104,6 +5185,7 @@ impl Window {
             is_emoji: false,
             subpixel_rendering,
             dilation,
+            foreground: [0, 0, 0, 255],
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
@@ -5111,7 +5193,7 @@ impl Window {
             let tile = self
                 .sprite_atlas
                 .get_or_insert_with(params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                    let (size, bytes) = self.text_system().rasterize_glyph(&params, raster_bounds)?;
                     Ok(Some((size, Cow::Owned(bytes))))
                 })?
                 .expect("Callback above only errors or returns Some");
@@ -5180,6 +5262,18 @@ impl Window {
         glyph_id: GlyphId,
         font_size: Pixels,
     ) -> Result<()> {
+        self.paint_emoji_with_color(origin, font_id, glyph_id, font_size, Hsla::black())
+    }
+
+    /// Paints a color glyph using the run color for foreground palette entries.
+    pub fn paint_emoji_with_color(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
@@ -5194,14 +5288,23 @@ impl Window {
             is_emoji: true,
             subpixel_rendering: false,
             dilation: 0,
+            foreground: u32::from(color.to_rgb()).to_be_bytes(),
         };
+        let uses_foreground = self.text_system().glyph_uses_foreground(&params);
+        let mut params = params;
+        if !uses_foreground {
+            params.foreground = [0, 0, 0, 255];
+        }
 
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
+        let raster_bounds = match self.foreground_glyph_tiles.get(&params) {
+            Some((_, bounds)) => *bounds,
+            None => self.text_system().raster_bounds(&params)?,
+        };
         if !raster_bounds.is_zero() {
             let tile = self
                 .sprite_atlas
                 .get_or_insert_with(params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                    let (size, bytes) = self.text_system().rasterize_glyph(&params, raster_bounds)?;
                     Ok(Some((size, Cow::Owned(bytes))))
                 })?
                 .expect("Callback above only errors or returns Some");
@@ -5210,6 +5313,10 @@ impl Window {
                 origin: integer_origin + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
             };
+            if uses_foreground {
+                self.foreground_glyph_tiles
+                    .insert(params, (tile, raster_bounds));
+            }
             let content_mask = self.snapped_content_mask();
             let opacity = self.element_opacity();
 
@@ -5225,6 +5332,12 @@ impl Window {
             });
         }
         Ok(())
+    }
+
+    /// Invalidate SVG assets at or beneath this path and redraw their consumers.
+    pub fn invalidate_svg(&mut self, path: &str) {
+        self.sprite_atlas.remove_svg(path);
+        self.refresh();
     }
 
     /// Paint a monochrome SVG into the scene for the next frame at the current stacking context.
@@ -5319,6 +5432,11 @@ impl Window {
             return Ok(());
         }
 
+        let visible_bounds_snapped = self.snap_bounds(visible_bounds);
+        let content_mask = self.snapped_content_mask();
+        if visible_bounds_snapped.intersect(&content_mask.bounds).is_empty() {
+            return Ok(());
+        }
         let params = RenderImageParams {
             image_id: data.id,
             frame_index,
@@ -5326,7 +5444,7 @@ impl Window {
 
         let tile = self
             .sprite_atlas
-            .get_or_insert_with(params.into(), &mut || {
+            .get_or_insert_with(params.clone().into(), &mut || {
                 Ok(Some((
                     data.size(frame_index),
                     Cow::Borrowed(
@@ -5336,8 +5454,7 @@ impl Window {
                 )))
             })?
             .expect("Callback above only returns Some");
-
-        let visible_bounds_snapped = self.snap_bounds(visible_bounds);
+        self.image_tiles.insert(params, (tile, Some(data)));
 
         let sub_tile = if visible_bounds == image_bounds {
             tile
@@ -5430,9 +5547,22 @@ impl Window {
             };
 
             self.sprite_atlas.remove(&params.clone().into());
+            self.image_tiles.remove(&params);
         }
 
         Ok(())
+    }
+
+    /// Images referenced by the window's current image tiles.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn displayed_images(&self) -> Vec<Arc<RenderImage>> {
+        self.image_tiles.values().filter_map(|(_, image)| image.clone()).collect()
+    }
+
+    /// Returns whether a particular frame is present in the sprite atlas.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_image_frame_atlas_entry(&self, data: &RenderImage, frame_index: usize) -> bool {
+        self.sprite_atlas.contains(&RenderImageParams { image_id: data.id, frame_index }.into())
     }
 
     /// Returns whether every frame of an image is present in the sprite atlas.
@@ -5595,6 +5725,13 @@ impl Window {
     pub fn set_view_id(&mut self, view_id: EntityId) {
         self.invalidator.debug_assert_prepaint();
         self.next_frame.dispatch_tree.set_view_id(view_id);
+    }
+
+    /// Whether a view participated in the last completed frame, including
+    /// cached view trees. Embedded web pages use this to tell their browser
+    /// when they are off screen. This does not imply that the view is unclipped.
+    pub fn was_view_rendered(&self, view: EntityId) -> bool {
+        self.rendered_frame.dispatch_tree.view_path_reversed(view).next().is_some()
     }
 
     /// Get the entity ID for the currently rendering view
@@ -5874,6 +6011,8 @@ impl Window {
         self.last_input_modality = match &event {
             PlatformInput::KeyDown(_) => InputModality::Keyboard,
             PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
+            // A drag from another app moves the pointer without sending mouse moves.
+            PlatformInput::FileDrop(_) => InputModality::Mouse,
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
         };
@@ -6318,6 +6457,7 @@ impl Window {
                         key: key.to_string(),
                         key_char: None,
                         modifiers: Modifiers::default(),
+                        ..Default::default()
                     });
                 }
             }
@@ -7770,6 +7910,15 @@ impl<V: 'static + Render> WindowHandle<V> {
         cx.update_window(self.any_handle, |_, window, _| window.is_window_active())
             .ok()
     }
+
+    /// Synchronizes pending updates for this window and captures its current frame as an RGBA image.
+    #[cfg(any(test, feature = "test-support", feature = "render-to-image"))]
+    pub fn render_current_to_image<C: crate::AppContext>(
+        &self,
+        cx: &mut C,
+    ) -> anyhow::Result<image::RgbaImage> {
+        self.any_handle.render_current_to_image(cx)
+    }
 }
 
 impl<V> Copy for WindowHandle<V> {}
@@ -7860,6 +8009,68 @@ impl AnyWindowHandle {
             .context("the type of the window's root view has changed")?;
 
         cx.read_window(&view, read)
+    }
+
+    /// Synchronizes pending updates for this window and captures its current frame as an RGBA image.
+    #[cfg(any(test, feature = "test-support", feature = "render-to-image"))]
+    pub fn render_current_to_image<C: crate::AppContext>(
+        self,
+        cx: &mut C,
+    ) -> anyhow::Result<image::RgbaImage> {
+        anyhow::ensure!(!draw_in_progress(), "cannot capture window image during draw");
+
+        // SIGLIFY: separate update closures flush App effects between phases;
+        // two passes bound animation cascades; schedule/wake re-arms presentation
+        // because draw() sets needs_present without calling present().
+        for _ in 0..2 {
+            self.update(cx, |_, window, cx| -> anyhow::Result<()> {
+                anyhow::ensure!(
+                    window.rendered_frame_size.is_some(),
+                    "no window frame has been rendered yet"
+                );
+                let size = window.platform_window.content_size();
+                let scale = window.platform_window.scale_factor();
+                if size.width > px(0.) && size.height > px(0.) && scale > 0.0 {
+                    if window.viewport_size != size || window.scale_factor != scale {
+                        window.bounds_changed(cx);
+                    } else if window.rendered_frame_size != Some((size, scale)) {
+                        window.refresh();
+                    }
+                }
+                for callback in window.next_frame_callbacks.take() {
+                    callback(window, cx);
+                }
+                Ok(())
+            })??;
+
+            let drew = self.update(cx, |_, window, cx| -> bool {
+                if !window.invalidator.is_dirty() && window.dirty_views.is_empty() {
+                    return false;
+                }
+                window.draw(cx).clear(cx);
+                true
+            })?;
+
+            if !drew
+                && self.update(cx, |_, window, _| {
+                    window.next_frame_callbacks.borrow().is_empty()
+                })?
+            {
+                break;
+            }
+        }
+
+        self.update(cx, |_, window, _| {
+            if window.invalidator.is_dirty()
+                || !window.dirty_views.is_empty()
+                || !window.next_frame_callbacks.borrow().is_empty()
+                || window.needs_present.get()
+            {
+                window.platform_window.schedule_frame();
+                window.invalidator.wake_platform();
+            }
+            window.render_to_image()
+        })?
     }
 }
 

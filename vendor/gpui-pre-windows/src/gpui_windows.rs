@@ -1,4 +1,5 @@
 #![cfg(target_os = "windows")]
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 
 mod clipboard;
 mod destination_list;
@@ -38,6 +39,7 @@ pub(crate) use vsync::*;
 pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
+pub use keyboard::is_native_character_input;
 pub use platform::WindowsPlatform;
 
 pub(crate) use windows::Win32::Foundation::HWND;

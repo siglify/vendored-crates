@@ -1,4 +1,5 @@
 #![cfg(target_os = "macos")]
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 //! macOS platform implementation for GPUI.
 //!
 //! macOS screens have a y axis that goes up from the bottom of the screen and
@@ -43,6 +44,7 @@ pub(crate) use platform::*;
 pub(crate) use window::*;
 
 pub use platform::MacPlatform;
+pub use events::{OptionAsAlt, option_as_alt, set_option_as_alt};
 
 trait BoolExt {
     fn to_objc(self) -> Bool;

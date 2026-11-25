@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 mod font_fallbacks;
 mod font_features;
 mod line;
@@ -232,6 +233,7 @@ pub struct TextSystem {
     platform_text_system: Arc<dyn PlatformTextSystem>,
     font_ids_by_font: RwLock<FxHashMap<Font, CachedFont>>,
     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
+    font_tables: RwLock<FxHashMap<(FontId, [u8; 4]), Option<Arc<[u8]>>>>,
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<CharWidthCache>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
@@ -255,6 +257,7 @@ impl TextSystem {
         TextSystem {
             platform_text_system,
             font_metrics: RwLock::default(),
+            font_tables: RwLock::default(),
             raster_bounds: RwLock::default(),
             font_ids_by_font: RwLock::default(),
             wrapper_pool: Mutex::default(),
@@ -497,6 +500,21 @@ impl TextSystem {
         padding_top + ascent
     }
 
+    /// SIGLIFY: Unscaled metrics for terminal cell geometry.
+    pub fn font_metrics(&self, font_id: FontId) -> FontMetrics {
+        self.read_metrics(font_id, |metrics| *metrics)
+    }
+
+    /// SIGLIFY: OpenType data for terminal metrics, without changing UI metrics.
+    pub fn font_table(&self, font_id: FontId, tag: [u8; 4]) -> Option<Arc<[u8]>> {
+        if let Some(table) = self.font_tables.read().get(&(font_id, tag)) {
+            return table.clone();
+        }
+        let table = self.platform_text_system.font_table(font_id, tag).map(Arc::from);
+        self.font_tables.write().insert((font_id, tag), table.clone());
+        table
+    }
+
     fn read_metrics<T>(&self, font_id: FontId, read: impl FnOnce(&FontMetrics) -> T) -> T {
         let lock = self.font_metrics.upgradable_read();
 
@@ -530,6 +548,10 @@ impl TextSystem {
 
     /// Get the rasterized size and location of a specific, rendered glyph.
     pub(crate) fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+        // Foreground variants live in the window's scene, not this persistent cache.
+        if self.glyph_uses_foreground(params) {
+            return self.platform_text_system.glyph_raster_bounds(params);
+        }
         let raster_bounds = self.raster_bounds.upgradable_read();
         if let Some(bounds) = raster_bounds.get(params) {
             Ok(*bounds)
@@ -544,10 +566,14 @@ impl TextSystem {
     pub(crate) fn rasterize_glyph(
         &self,
         params: &RenderGlyphParams,
+        raster_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        let raster_bounds = self.raster_bounds(params)?;
         self.platform_text_system
             .rasterize_glyph(params, raster_bounds)
+    }
+
+    pub(crate) fn glyph_uses_foreground(&self, params: &RenderGlyphParams) -> bool {
+        self.platform_text_system.glyph_uses_foreground(params)
     }
 
     /// Returns the dilation level to use for a glyph painted in the given color.
@@ -1112,6 +1138,7 @@ pub struct RenderGlyphParams {
     pub is_emoji: bool,
     pub subpixel_rendering: bool,
     pub dilation: u8,
+    pub foreground: [u8; 4],
 }
 
 impl Eq for RenderGlyphParams {}
@@ -1126,6 +1153,7 @@ impl Hash for RenderGlyphParams {
         self.is_emoji.hash(state);
         self.subpixel_rendering.hash(state);
         self.dilation.hash(state);
+        self.foreground.hash(state);
     }
 }
 

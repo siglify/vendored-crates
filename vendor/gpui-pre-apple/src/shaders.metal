@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 #include <metal_stdlib>
 #include <simd/simd.h>
 
@@ -897,6 +898,14 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
   return ycbcrToRGBTransform * ycbcr;
+}
+
+// SIGLIFY: a BGRA surface (an embedded browser's IOSurface) is drawn as it is.
+fragment float4 bgra_surface_fragment(SurfaceFragmentInput input [[stage_in]],
+                                      texture2d<float> texture
+                                      [[texture(SurfaceInputIndex_YTexture)]]) {
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  return texture.sample(texture_sampler, input.texture_position);
 }
 
 float4 hsla_to_rgba(Hsla hsla) {

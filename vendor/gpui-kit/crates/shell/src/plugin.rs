@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 //! Who a plugin is, what it may do, and where its data lives.
 //!
 //! A host that runs one application from a directory needs none of this: the
@@ -1339,7 +1340,20 @@ impl ShellRuntime {
         } else {
             "main.js".to_owned()
         };
-        let root = crate::runtime::resolve_app_root(&root, &entry)?;
+        self.try_load_entry(root, &entry, window, cx)
+    }
+
+    /// [`Self::try_load`] with the entry file named by the host instead of
+    /// `gpui-shell.json` or `main.js`. The entry must be inside `root`.
+    pub fn try_load_entry(
+        self: &Rc<Self>,
+        root: impl AsRef<Path>,
+        entry: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<Entity<ShellRoot>> {
+        let root = crate::runtime::resolve_app_root(root.as_ref(), entry)?;
+        let entry = entry.to_owned();
         let policy = Rc::new(crate::policy::default().duplicate());
         let view = load_view_with_policy(self, &root, &entry, policy.clone(), window, cx)?;
         Ok(cx.new(|cx| ShellRoot::with_application(view, root, entry, policy, window, cx)))

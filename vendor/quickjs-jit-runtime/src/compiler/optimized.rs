@@ -1,3 +1,4 @@
+// Modified by Siglify, Inc. Copyright (c) 2026 Siglify, Inc. for modifications.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NumericBinaryOp {
     Add,
@@ -8792,6 +8793,7 @@ fn emit_opt_specialized_call(
     native: Option<&NativeCallSite>,
     guard: u32,
     scalar_result: bool,
+    #[allow(unused_variables)]
     diagnostic_key: Option<crate::runtime::FunctionKey>,
 ) -> Result<usize, CompileFailure> {
     use cranelift_codegen::ir::{types, InstBuilder, MemFlags};
