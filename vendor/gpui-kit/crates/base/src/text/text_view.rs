@@ -3539,3 +3539,38 @@ mod tests {
         );
     }
 }
+
+// HERDR: HTML paragraphs carry no source spans; two inline flows in one HTML
+// block used to share an element id and panic in prepaint.
+#[cfg(test)]
+mod herdr_html_inline_flows {
+    use super::*;
+    use gpui::{div, prelude::*, px, TestAppContext};
+
+    struct Root(Entity<TextViewState>);
+    impl Render for Root {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(400.)).child(TextView::new(&self.0))
+        }
+    }
+
+    #[gpui::test]
+    fn two_inline_flows_in_one_html_block_render(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        // A CodeRabbit PR comment, trimmed.
+        let src = r#"<!-- end -->
+<details>
+<summary><strong>Merge Risk:</strong> <strong>Low</strong> · up to <code>36949</code></summary>
+<dl>
+<dd>
+
+<details>
+<summary><strong>Checks · <sup><picture><img src="https://example.com/a.svg" width="14" height="14" align="middle" alt="Passed" title="Passed"></picture></sup> 4 · <sup><picture><img src="https://example.com/b.svg" width="14" height="14" align="middle" alt="Failed" title="Failed"></picture></sup> 1</strong></summary>
+<dl>
+<dd>
+"#;
+        let (_root, cx) = cx.add_window_view(|_, cx| Root(cx.new(|cx| TextViewState::markdown(src, cx))));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+}

@@ -262,6 +262,8 @@ pub(crate) enum Component {
     /// out one where the other was asked for, and `Textarea::new` will not take
     /// an `InputState`.
     Textarea(crate::entities::EntityHandle),
+    // HERDR: source-code editor element, backed by retained EditorState.
+    Editor(crate::entities::EntityHandle),
 
     /// A spinbutton frame over the same `InputState` a [`Component::Input`]
     /// holds: there is no numeric state type, only a text state carrying a
@@ -684,6 +686,8 @@ impl Component {
             Component::Scrollbar(_) => "Scrollbar",
             Component::Input(_) => "Input",
             Component::Textarea(_) => "Textarea",
+            // HERDR: source editor in spec diagnostics.
+            Component::Editor(_) => "Editor",
             Component::NumberInput(_) => "NumberInput",
             Component::OtpInput(_) => "OtpInput",
             Component::Svg(_) => "svg",
@@ -1386,6 +1390,8 @@ impl SpecArena {
             | Component::SliderThumb(handle) => out.push_str(&format!(" #{handle}")),
             Component::Input(handle)
             | Component::Textarea(handle)
+            // HERDR: editor handles also participate in retained-state reachability.
+            | Component::Editor(handle)
             | Component::NumberInput(handle)
             | Component::OtpInput(handle) => out.push_str(&format!(" #{handle}")),
             _ => {}

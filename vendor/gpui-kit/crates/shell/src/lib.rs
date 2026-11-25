@@ -64,12 +64,16 @@ pub(crate) mod capability;
 mod component;
 mod component_registry;
 mod input_tokens;
+// HERDR: syntax highlighting shipped with script editors.
+mod syntax;
 pub use input_tokens::{
     InlineTokenCallbacks, inline_token_click_data, inline_token_context_data,
     inline_token_hover_data, input_token_state_methods, textarea_token_state_methods,
 };
 pub(crate) mod dependencies;
 pub mod dock;
+mod drag_paths;
+pub use drag_paths::DraggedPaths;
 pub(crate) mod engine;
 pub(crate) mod entities;
 pub(crate) mod error;
@@ -97,10 +101,12 @@ mod typings;
 pub(crate) mod value;
 pub mod view;
 pub(crate) mod watch;
+pub use watch::application_file_counts;
 
 pub use anyhow;
+pub use value::set_pixel_scale;
 pub use assets::AppAssets;
-pub use capability::{Capabilities, ExecuteGrant, HttpRequestGrant};
+pub use capability::{Capabilities, ExecuteGrant, HttpRequestGrant, NetworkGrant};
 pub use component::ComponentArgs;
 #[cfg(test)]
 pub(crate) use component_registry::ComponentState;

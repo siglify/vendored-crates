@@ -46,7 +46,7 @@ use std::sync::OnceLock;
 use crate::error::{Result as ShellResult, ShellError};
 use gpui::inspector_reflection::FunctionReflection;
 use gpui::{
-    AbsoluteLength, DefiniteLength, FontWeight, Length, StyleRefinement, Styled, px, relative, rems,
+    AbsoluteLength, DefiniteLength, FontWeight, Length, StyleRefinement, Styled, relative, rems,
 };
 use gpui_base::StyledExt as _;
 
@@ -600,7 +600,7 @@ fn parse_length(value: &Bridged, method: &str) -> ShellResult<LengthLiteral> {
         }
         if let Some(number) = text.strip_suffix("px") {
             return parse_number(number, text, method)
-                .map(|value| LengthLiteral::Absolute(px(value).into()));
+                .map(|value| LengthLiteral::Absolute(crate::value::scaled_px(value).into()));
         }
         return Err(ShellError::runtime(format!(
             "`{method}` expects a length: a number of pixels, or a string like \
@@ -687,7 +687,7 @@ fn edit_distance(left: &str, right: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Fill, Hsla};
+    use gpui::{Fill, Hsla, px};
 
     #[test]
     fn the_reflection_table_is_populated() {

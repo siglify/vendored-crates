@@ -1,4 +1,6 @@
 #![cfg(target_os = "macos")]
+// HERDR: a vendored copy; upstream builds it with its own lint settings.
+#![allow(deprecated, unexpected_cfgs)]
 //! macOS platform implementation for GPUI.
 //!
 //! macOS screens have a y axis that goes up from the bottom of the screen and
@@ -55,6 +57,7 @@ pub(crate) use window::*;
 pub(crate) use text_system::*;
 
 pub use platform::MacPlatform;
+pub use events::{OptionAsAlt, option_as_alt, set_option_as_alt};
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;

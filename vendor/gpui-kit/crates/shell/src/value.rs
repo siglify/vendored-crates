@@ -7,6 +7,20 @@
 
 use crate::error::{Result as ShellResult, ShellError};
 use gpui::{Hsla, Pixels, px, rgba};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+// HERDR: one app-wide zoom applied to every pixel length a script writes, so
+// zooming the host app zooms every script view with it.
+static PIXEL_SCALE: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0
+
+/// Sets the zoom applied to script pixel lengths (1 = as written).
+pub fn set_pixel_scale(scale: f32) {
+    PIXEL_SCALE.store(scale.to_bits(), Ordering::Relaxed);
+}
+
+pub(crate) fn scaled_px(value: f32) -> Pixels {
+    px(value * f32::from_bits(PIXEL_SCALE.load(Ordering::Relaxed)))
+}
 
 /// A script argument after bridging, stored in the spec arena.
 ///
@@ -53,7 +67,7 @@ impl Bridged {
 
     /// A number is pixels.
     pub fn as_pixels(&self) -> ShellResult<Pixels> {
-        Ok(px(self.as_f32()?))
+        Ok(scaled_px(self.as_f32()?))
     }
 
     /// A `#rgb`, `#rrggbb`, or `#rrggbbaa` color value.

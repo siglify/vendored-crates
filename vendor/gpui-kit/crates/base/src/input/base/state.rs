@@ -129,6 +129,8 @@ pub enum InputEvent {
     PressEnter { secondary: bool, shift: bool },
     Focus,
     Blur,
+    /// A paste found no text on the clipboard (an image, say): the owner may read it.
+    PasteWithoutText,
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -2850,6 +2852,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         let Some(mut new_text) = clipboard.text().filter(|text| !text.is_empty()) else {
+            cx.emit(InputEvent::PasteWithoutText);
             return;
         };
         // A paste is one atomic edit, never part of a typing run.

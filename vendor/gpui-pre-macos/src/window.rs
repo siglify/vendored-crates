@@ -1,10 +1,11 @@
 use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
-    TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
-    kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
+    TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native, main_queue_source,
+    kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
+    kTISTypeKeyboardInputMethodWithoutModes, kTISTypeKeyboardInputMethodModeEnabled,
     ns_string, renderer,
 };
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "render-to-image"))]
 use anyhow::Result;
 use block2::RcBlock;
 use cocoa::{
@@ -32,12 +33,11 @@ use gpui::{
     SharedString, Size, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControlArea, WindowKind, WindowParams, WindowVisibility, point, px, size,
 };
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "render-to-image"))]
 use image::RgbaImage;
 
 use core_foundation::base::{CFRelease, CFTypeRef};
 use core_foundation_sys::base::CFEqual;
-use core_foundation_sys::number::{CFBooleanGetValue, CFBooleanRef};
 use core_graphics::display::{CGDirectDisplayID, CGRect};
 use ctor::ctor;
 use futures::channel::oneshot;
@@ -665,6 +665,11 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
+    // HERDR: an idle window stops its display link (`step`) and the frame
+    // waker starts it again, instead of waking every vsync for nothing.
+    wake_source: Option<dispatch2::DispatchRetained<dispatch2::DispatchSource>>,
+    woken: bool,
+    idle_frames: u32,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -1098,6 +1103,9 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
+                wake_source: None,
+                woken: false,
+                idle_frames: 0,
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -1388,6 +1396,10 @@ impl Drop for MacWindow {
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
         this.frame_source.take();
+        // HERDR: its context is the native view, which goes with the window.
+        if let Some(source) = this.wake_source.take() {
+            source.cancel();
+        }
         unsafe {
             this.native_window.setDelegate_(nil);
         }
@@ -1871,7 +1883,21 @@ impl PlatformWindow for MacWindow {
             };
             this.native_window.setBackgroundColor_(background_color);
 
-            if background_appearance != WindowBackgroundAppearance::Blurred {
+            // From macOS 26 Liquid Glass rebuilt the layers under NSVisualEffectView, so the
+            // view below no longer blurs: the window turns see-through without frost. Ask the
+            // window server for the blur directly there instead.
+            if is_macos_version_at_least(NSOperatingSystemVersion::new(26, 0, 0)) {
+                let blurred = background_appearance == WindowBackgroundAppearance::Blurred;
+                let window_number: NSInteger = msg_send![this.native_window, windowNumber];
+                CGSSetWindowBackgroundBlurRadius(
+                    CGSMainConnectionID(),
+                    window_number,
+                    if blurred { WINDOW_SERVER_BLUR_RADIUS } else { 0 },
+                );
+                if let Some(blur_view) = this.blurred_view.take() {
+                    NSView::removeFromSuperview(blur_view);
+                }
+            } else if background_appearance != WindowBackgroundAppearance::Blurred {
                 if let Some(blur_view) = this.blurred_view {
                     NSView::removeFromSuperview(blur_view);
                     this.blurred_view = None;
@@ -2013,6 +2039,16 @@ impl PlatformWindow for MacWindow {
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.as_ref().lock().request_frame_callback = Some(callback);
+    }
+
+    // HERDR: GPUI calls this when the window needs a frame. It may run while
+    // the window state is locked, so it only signals; `wake_frames` runs on
+    // the main queue and restarts the display link.
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let mut lock = self.0.as_ref().lock();
+        let data = lock.native_view.as_ptr() as *mut c_void;
+        let source = lock.wake_source.get_or_insert_with(|| main_queue_source(data, wake_frames)).clone();
+        Some(Rc::new(move || source.merge_data(1)))
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>) {
@@ -2347,7 +2383,7 @@ impl PlatformWindow for MacWindow {
         NSBeep()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support", feature = "render-to-image"))]
     fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
         let mut this = self.0.lock();
         this.renderer.render_to_image(scene)
@@ -2598,15 +2634,8 @@ extern "C" fn handle_key_up(this: &Object, _: Sel, native_event: id) {
 //   - In vim mode with `jj` bound to `vim::NormalBefore` in insert mode, typing 'j i' with
 //     Japanese IME should produce "じ" (ji), not "jい"
 
-/// Returns true if the current keyboard input source is a composition-based IME
-/// (e.g. Japanese Hiragana, Korean, Chinese Pinyin) that produces non-ASCII output.
-///
-/// This checks two properties:
-/// 1. The source type is `kTISTypeKeyboardInputMode` (an IME input mode, not a plain
-///    keyboard layout). This excludes non-ASCII layouts like Armenian and Ukrainian
-///    that map keys directly without composition.
-/// 2. The source is not ASCII-capable, which excludes modes like Japanese Romaji that
-///    produce ASCII characters and should allow multi-stroke keybindings like `jj`.
+/// IMEs can compose even when ASCII-capable (e.g. Vietnamese Telex). Plain
+/// keyboard layouts, including non-ASCII ones, don't need composition routing.
 unsafe fn is_ime_input_source_active() -> bool {
     unsafe {
         let source = TISCopyCurrentKeyboardInputSource();
@@ -2616,21 +2645,16 @@ unsafe fn is_ime_input_source_active() -> bool {
 
         let source_type =
             TISGetInputSourceProperty(source, kTISPropertyInputSourceType as *const c_void);
-        let is_input_mode = !source_type.is_null()
-            && CFEqual(
-                source_type as CFTypeRef,
-                kTISTypeKeyboardInputMode as CFTypeRef,
-            ) != 0;
-
-        let is_ascii = TISGetInputSourceProperty(
-            source,
-            kTISPropertyInputSourceIsASCIICapable as *const c_void,
-        );
-        let is_ascii_capable = !is_ascii.is_null() && CFBooleanGetValue(is_ascii as CFBooleanRef);
+        let is_input_method = !source_type.is_null()
+            && [
+                kTISTypeKeyboardInputMode,
+                kTISTypeKeyboardInputMethodWithoutModes,
+                kTISTypeKeyboardInputMethodModeEnabled,
+            ].iter().any(|kind| CFEqual(source_type as CFTypeRef, *kind as CFTypeRef) != 0);
 
         CFRelease(source as CFTypeRef);
 
-        is_input_mode && !is_ascii_capable
+        is_input_method
     }
 }
 
@@ -2669,6 +2693,14 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
             }
 
             drop(lock);
+
+            // Alt shortcuts must never enter AppKit's Option/dead-key composition.
+            if key_down_event.keystroke.modifiers.alt
+                && !key_down_event.keystroke.modifiers.platform
+                && crate::events::option_as_alt().uses_alt(key_down_event.keystroke.option_side)
+            {
+                return run_callback(PlatformInput::KeyDown(key_down_event));
+            }
 
             let is_composing =
                 with_input_handler(this, |input_handler| input_handler.marked_text_range())
@@ -3329,7 +3361,34 @@ extern "C" fn step(view: *mut c_void) {
             signal_source,
             ..Default::default()
         });
-        window_state.lock().request_frame_callback = Some(callback);
+        let mut lock = window_state.lock();
+        lock.request_frame_callback = Some(callback);
+        // HERDR: a few vsyncs without a wake: nothing to draw. Every wake (a
+        // notify, input, a timer) restarts it through the frame waker, so
+        // waiting longer only wakes for nothing: a 10 fps spinner kept it
+        // running at 120 Hz when this waited half a second.
+        if std::mem::take(&mut lock.woken) {
+            lock.idle_frames = 0;
+        } else {
+            lock.idle_frames += 1;
+            if lock.idle_frames >= 3 && lock.frame_source.as_ref().is_some_and(|f| f.is_running()) {
+                lock.stop_display_link();
+            }
+        }
+    }
+}
+
+// HERDR: the window needs frames again.
+extern "C" fn wake_frames(view: *mut c_void) {
+    let view = view as id;
+    let window_state = unsafe { get_window_state(&*view) };
+    let mut lock = window_state.lock();
+    lock.woken = true;
+    lock.idle_frames = 0;
+    if lock.request_frame_callback.is_some()
+        && !lock.frame_source.as_ref().is_some_and(|f| f.is_running())
+    {
+        lock.start_display_link();
     }
 }
 
@@ -3771,6 +3830,15 @@ fn display_id_for_screen(screen: id) -> Option<CGDirectDisplayID> {
         let screen_number: NSUInteger = msg_send![screen_number, unsignedIntegerValue];
         Some(screen_number as CGDirectDisplayID)
     }
+}
+
+/// How far the window server blurs the desktop behind a blurred window (macOS 26+).
+const WINDOW_SERVER_BLUR_RADIUS: i64 = 50;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGSMainConnectionID() -> id;
+    fn CGSSetWindowBackgroundBlurRadius(connection_id: id, window_id: NSInteger, radius: i64) -> i32;
 }
 
 extern "C" fn blurred_view_init_with_frame(this: &Object, _: Sel, frame: NSRect) -> id {

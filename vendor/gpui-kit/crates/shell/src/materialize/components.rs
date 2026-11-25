@@ -40,6 +40,8 @@ pub(super) mod slider;
 pub(super) mod table;
 pub(super) mod tabs;
 pub(super) mod textarea;
+// HERDR: code-editor surface.
+pub(super) mod editor;
 pub(super) mod toggle;
 pub(super) mod tooltip;
 pub(super) mod virtual_list;

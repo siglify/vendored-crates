@@ -1112,7 +1112,9 @@ impl WaylandWindowStatePtr {
                             state.resize_throttle = true;
                         }
                         if !configure.fullscreen && !configure.maximized {
-                            configure.size = if got_unmaximized {
+                            // HERDR: restore the windowed size only when the compositor leaves
+                            // it to us; a size it sends (e.g. tiling a maximized window) wins.
+                            configure.size = if got_unmaximized && configure.size.is_none() {
                                 Some(state.window_bounds.size)
                             } else {
                                 compute_outer_size(state.inset(), configure.size, state.tiling)
@@ -1956,6 +1958,15 @@ impl PlatformWindow for WaylandWindow {
 
     fn on_button_layout_changed(&self, callback: Box<dyn FnMut()>) {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
+    }
+
+    // HERDR: capture uses the window's atlas, without acquiring a display surface.
+    #[cfg(feature = "render-to-image")]
+    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        self.borrow_mut()
+            .renderer.as_mut()
+            .ok_or_else(|| anyhow::anyhow!("window renderer is unavailable"))?
+            .render_to_image(scene)
     }
 
     fn draw(&self, scene: &Scene) {

@@ -43,7 +43,9 @@ const CONTEXT: &str = "ShellRoot";
 ///
 /// Toast timeouts are wall-clock, not frame-driven, so they have to be sampled;
 /// 50ms is below the threshold where a dismissal reads as late and far above
-/// the cost of one comparison per mounted toast.
+/// the cost of one comparison per mounted toast. The clock only runs while a
+/// toast is mounted: an app hosting dozens of roots must not wake each of them
+/// twenty times a second to find nothing to advance.
 const TOAST_TICK: Duration = Duration::from_millis(50);
 
 /// How many active toasts are mounted at once. Older toasts stay in the manager
@@ -147,6 +149,9 @@ pub struct ShellRoot {
     /// Source of ids for toasts pushed without one. Monotonic so that a
     /// replaced id can never collide with a live toast.
     next_toast_ordinal: u64,
+    /// Whether the toast lifecycle clock is running. It starts with the first
+    /// toast and stops once the last one has finished its exit.
+    toast_clock_running: bool,
     /// The window's one tooltip layer. Base owns the delay, the grace period
     /// between two triggers and the paint priority; the root owns only the
     /// decision to have one, and what an appearing tooltip looks like.
@@ -154,6 +159,8 @@ pub struct ShellRoot {
     /// The performance HUD, while a script has asked for one. See
     /// [`ShellRoot::show_fps_monitor`].
     fps_hud: Option<FpsHudRequest>,
+    /// HERDR: size to the content instead of filling the parent (floating views).
+    fit_content: bool,
 }
 
 /// Where the performance HUD sits over the window and how it behaves.
@@ -215,9 +222,8 @@ impl ShellRoot {
     /// Takes an [`AnyView`] rather than an `Entity<ScriptView>` so the host can
     /// mount a Rust view too — the error screen a failed script load falls back
     /// to is not a `ScriptView`, and the root must be able to carry it.
-    pub fn new(content: AnyView, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(content: AnyView, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         install_key_bindings(cx);
-        Self::spawn_toast_clock(window, cx);
 
         Self {
             content,
@@ -230,8 +236,19 @@ impl ShellRoot {
             toast_state: ToastStackState::default(),
             toast_focus_handle: cx.focus_handle().tab_stop(true),
             next_toast_ordinal: 0,
+            toast_clock_running: false,
             tooltip_overlay: cx.new(|_| TooltipOverlay::new().render_with(render_tooltip)),
             fps_hud: None,
+            fit_content: false,
+        }
+    }
+
+    /// HERDR: lays the view out at its content's size rather than filling its
+    /// parent, for views that float and size themselves.
+    pub fn set_fit_content(&mut self, fit: bool, cx: &mut Context<Self>) {
+        if self.fit_content != fit {
+            self.fit_content = fit;
+            cx.notify();
         }
     }
 
@@ -493,14 +510,13 @@ impl ShellRoot {
     ///
     /// Toasts never take focus: they report what already happened, so stealing
     /// focus from the work that caused them would be a regression, not a
-    /// notification. `_window` is unused but kept in the signature because a
-    /// `&mut Window` is what makes this operation legal at all — it can only be
-    /// reached from an `Event` or `Task` call scope (`docs/gpui-shell.md`
-    /// §16.2).
+    /// notification. The `&mut Window` is what makes this operation legal at
+    /// all — it can only be reached from an `Event` or `Task` call scope
+    /// (`docs/gpui-shell.md` §16.2) — and what the toast clock runs in.
     pub fn push_toast(
         &mut self,
         toast: ToastRequest,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !overlay_mutation_allowed("push_toast") {
@@ -516,6 +532,7 @@ impl ShellRoot {
         };
         self.toasts
             .push(id, toast, options, cx.background_executor().now());
+        self.start_toast_clock(window, cx);
         cx.notify();
     }
 
@@ -546,15 +563,32 @@ impl ShellRoot {
         }
     }
 
-    /// Samples the toast lifecycle clock forever, until the root is dropped.
+    /// Whether the toast lifecycle clock is running, which it does only while a
+    /// toast is mounted.
+    pub fn toast_clock_running(&self) -> bool {
+        self.toast_clock_running
+    }
+
+    /// Samples the toast lifecycle clock until the last toast has left.
     ///
     /// Toast timeouts are the one part of this host that advances without any
-    /// input, so nothing else would wake the view to retire them.
-    fn spawn_toast_clock(window: &mut Window, cx: &mut Context<Self>) {
+    /// input, so nothing else would wake the view to retire them; with no toast
+    /// mounted there is nothing to retire, and the clock stops rather than
+    /// waking the root for nothing.
+    fn start_toast_clock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.toast_clock_running {
+            return;
+        }
+        self.toast_clock_running = true;
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(TOAST_TICK).await;
-                if this.update(cx, |this, cx| this.advance_toasts(cx)).is_err() {
+                let more = this.update(cx, |this, cx| {
+                    this.advance_toasts(cx);
+                    this.toast_clock_running = !this.toasts.is_empty();
+                    this.toast_clock_running
+                });
+                if !matches!(more, Ok(true)) {
                     break;
                 }
             }
@@ -752,6 +786,7 @@ impl ShellRoot {
 
 impl Drop for ShellRoot {
     fn drop(&mut self) {
+        crate::materialize::forget_spins(self.content.entity_id());
         if let Some(application) = self.application_generation.take() {
             crate::engine::quickjs::cancel_application_tasks(&application);
         }
@@ -808,7 +843,7 @@ impl Render for ShellRoot {
         let tokens = Theme::global(cx).tokens;
         let (colors, radius, spacing) = (tokens.colors, tokens.radius, tokens.spacing);
 
-        div()
+        let root = div()
             .id("shell-root")
             // The window's base text size, from the theme rather than from
             // GPUI's default rem.
@@ -840,21 +875,34 @@ impl Render for ShellRoot {
                 cx.listener(Self::blur_on_background_press),
             )
             .relative()
-            .size_full()
-            .bg(colors.background)
+            .when(!self.fit_content, |root| root.size_full())
+            // HERDR: a fitted view still stops at its container's height: a
+            // column that can shrink, so a root with `min_h(0)` scrolls.
+            .when(self.fit_content, |root| root.flex().flex_col().min_h_0())
+            // HERDR: no background of its own. The host draws behind every view,
+            // and a floating view's rounded corners must show what's under it.
             .text_color(colors.foreground)
             // Painted back to front; see the stacking order on `ShellRoot`.
             .child(TextSelectionLayer)
-            .child(
+            .child(if self.fit_content {
+                self.content.clone().into_any_element()
+            } else {
                 self.content
                     .clone()
-                    .cached(StyleRefinement::default().size_full()),
-            )
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element()
+            })
+            // HERDR: its view's spinners, so a step doesn't rebuild the view.
+            .child({
+                crate::materialize::show_spins_of(self.content.entity_id());
+                crate::materialize::spin_layer(self.content.entity_id())
+            })
             .children(self.sheet_layer(&colors, &spacing, cx))
             .children(self.dialog_layer(&colors, &radius, &spacing, cx))
             .child(self.toast_layer(&colors, &radius, &spacing, cx))
             .child(self.tooltip_overlay.clone())
-            .children(self.fps_layer(window, cx))
+            .children(self.fps_layer(window, cx));
+        TextSelection::boundary(cx.entity_id(), root)
     }
 }
 

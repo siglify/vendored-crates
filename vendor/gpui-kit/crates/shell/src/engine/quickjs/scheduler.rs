@@ -75,7 +75,7 @@ use crate::{
     view::ScriptView,
 };
 
-use super::{ContextBinding, ShellRuntime, context_object, describe};
+use super::{ContextBinding, ShellRuntime, TaskBinding, context_object, describe};
 
 /// Installs the scheduling surface.
 ///
@@ -507,6 +507,24 @@ fn js_sleep<'js>(ctx: Ctx<'js>, ms: Opt<f64>) -> JsResult<Promise<'js>> {
         ),
     )?;
 
+    if SYNCHRONOUS_CLOSE.with_borrow(|pending| pending.is_some()) {
+        let due = std::time::Instant::now() + delay;
+        SYNCHRONOUS_CLOSE.with_borrow_mut(|pending| {
+            pending.as_mut().expect("synchronous close scope").push(Box::new(move |runtime| {
+                if std::time::Instant::now() < due { return false; }
+                if matches!(task.readiness(), Readiness::Ready(_))
+                    && let Some(resolve) = task.take_callback()
+                    && let Err(error) = runtime.with_js(|ctx| resolve.restore(ctx)?.call::<_, ()>(()))
+                {
+                    tracing::warn!("error settling View.close sleep: {error}");
+                }
+                finish(&task);
+                true
+            }));
+        });
+        return Ok(promise);
+    }
+
     let sleeping = task.clone();
     host.foreground
         .clone()
@@ -561,7 +579,7 @@ fn js_spawn<'js>(
     // An async `cx`, always — including at module top level, where the old
     // call-scoped one had to be omitted and the body was handed `undefined`.
     // It names no frame, so there is nothing to be absent.
-    let started = body.call::<_, Value>((context_object(&ctx, ContextBinding::Ambient)?,));
+    let started = body.call::<_, Value>((context_object(&ctx, task.binding())?,));
 
     match started {
         Ok(value) => match value.into_promise() {
@@ -643,6 +661,7 @@ fn schedule<'js>(
     )?;
 
     let ticking = task.clone();
+    let binding = task.binding();
     host.foreground
         .clone()
         .spawn(async move {
@@ -666,10 +685,10 @@ fn schedule<'js>(
                     // A timer handler is resumed script code like any other, so
                     // its `cx` is the async flavor: a handler that awaits keeps
                     // a usable context instead of having to reach for `with_cx`.
-                    move |ctx, _generation| {
+                    |ctx, _generation| {
                         callback
                             .restore(ctx)?
-                            .call::<_, ()>((context_object(ctx, ContextBinding::Ambient)?,))
+                            .call::<_, ()>((context_object(ctx, binding.clone())?,))
                     },
                 );
 
@@ -903,6 +922,15 @@ impl TaskState {
             cancellation: RefCell::new(None),
             callback: RefCell::new(callback),
         }
+    }
+
+    /// The `cx` binding for script this task runs: it belongs to the task's
+    /// owner and ends with the task's build.
+    fn binding(&self) -> ContextBinding {
+        ContextBinding::Task(Rc::new(TaskBinding {
+            owner: self.owner.clone(),
+            application: self.application.as_ref().map(Rc::downgrade),
+        }))
     }
 
     fn readiness(&self) -> Readiness {
@@ -1202,6 +1230,10 @@ where
     let host = host(ctx, api)?;
     let (promise, resolve, reject) = ctx.promise()?;
 
+    // Cancelling drops the work itself, not only its answer: a cancelled
+    // receive left running would still take the next message from a channel
+    // the replacement build reads too, and nobody would get it.
+    let (cancel, cancelled) = async_channel::bounded::<()>(1);
     let task = register(
         ctx,
         TaskState::new(
@@ -1209,14 +1241,61 @@ where
             scope::current_view().map(|view| view.downgrade()),
             Some(Persistent::save(ctx, resolve)),
         )
-        .with_rejection(Persistent::save(ctx, reject)),
+        .with_rejection(Persistent::save(ctx, reject))
+        .with_cancellation(move || {
+            let _ = cancel.try_send(());
+        }),
     )?;
+
+    if SYNCHRONOUS_CLOSE.with_borrow(|pending| pending.is_some()) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = smol::block_on(smol::future::or(
+                async move { let _ = cancelled.recv().await; None },
+                async move { Some(work.await) },
+            ));
+            let _ = sender.send(outcome);
+        });
+        SYNCHRONOUS_CLOSE.with_borrow_mut(|pending| {
+            pending.as_mut().expect("synchronous close scope").push(Box::new(move |runtime| {
+                let outcome = match receiver.try_recv() {
+                    Ok(Some(outcome)) => outcome,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+                    _ => { finish(&task); return true; }
+                };
+                if matches!(task.readiness(), Readiness::Ready(_)) {
+                    let resolve = task.take_callback();
+                    let reject = task.take_rejection();
+                    let result = runtime.with_js(|ctx| settle_awaited(ctx, resolve, reject, outcome));
+                    if let Err(error) = result {
+                        tracing::warn!("error settling View.close host call: {error}");
+                    }
+                }
+                finish(&task);
+                true
+            }));
+        });
+        return Ok(promise);
+    }
 
     let running = task.clone();
     host.foreground
         .clone()
         .spawn(async move {
-            let outcome = host.background.spawn(work).await;
+            let outcome = host
+                .background
+                .spawn(smol::future::or(
+                    async move {
+                        let _ = cancelled.recv().await;
+                        None
+                    },
+                    async move { Some(work.await) },
+                ))
+                .await;
+            let Some(outcome) = outcome else {
+                finish(&running);
+                return;
+            };
 
             if let Readiness::Ready(owner) = running.readiness() {
                 let resolve = running.take_callback();
@@ -1226,19 +1305,7 @@ where
                     &running.policy(),
                     running.application.clone(),
                     owner,
-                    move |ctx, _| match outcome {
-                        Ok(value) => match resolve {
-                            Some(resolve) => resolve.restore(ctx)?.call::<_, ()>((value,)),
-                            None => Ok(()),
-                        },
-                        Err(message) => match reject {
-                            Some(reject) => {
-                                let error = Exception::from_message(ctx.clone(), &message)?;
-                                reject.restore(ctx)?.call::<_, ()>((error,))
-                            }
-                            None => Ok(()),
-                        },
-                    },
+                    move |ctx, _| settle_awaited(ctx, resolve, reject, outcome),
                 );
             }
             finish(&running);
@@ -1246,6 +1313,46 @@ where
         .detach();
 
     Ok(promise)
+}
+
+/// Adds explicit cancellation without changing owning-view cancellation.
+pub(super) fn awaiting_cancellable<'js, T>(
+    ctx: &Ctx<'js>,
+    api: &'static str,
+    work: impl Future<Output = Result<T, String>> + Send + 'static,
+    cancellation_value: Option<T>,
+) -> JsResult<Promise<'js>>
+where
+    T: for<'a> IntoJs<'a> + Send + 'static,
+{
+    let Some(value) = cancellation_value else { return awaiting(ctx, api, work) };
+    let (stop, stopped) = async_channel::bounded::<()>(1);
+    let promise = awaiting(ctx, api, smol::future::or(
+        async move { let _ = stopped.recv().await; Ok(value) },
+        work,
+    ))?;
+    promise.as_object().expect("a promise is an object").set("cancel", Func::from(move || {
+        let _ = stop.try_send(());
+    }))?;
+    Ok(promise)
+}
+
+fn settle_awaited<'js, T: IntoJs<'js>>(
+    ctx: &Ctx<'js>,
+    resolve: Option<Persistent<Function<'static>>>,
+    reject: Option<Persistent<Function<'static>>>,
+    outcome: Result<T, String>,
+) -> JsResult<()> {
+    match outcome {
+        Ok(value) => match resolve {
+            Some(resolve) => resolve.restore(ctx)?.call::<_, ()>((value,)),
+            None => Ok(()),
+        },
+        Err(message) => match reject {
+            Some(reject) => reject.restore(ctx)?.call::<_, ()>((Exception::from_message(ctx.clone(), &message)?,)),
+            None => Ok(()),
+        },
+    }
 }
 
 /// A promise settled by work that must not run on this thread.
@@ -1397,6 +1504,38 @@ where
     Ok(promise)
 }
 
+type ClosingPoll = Box<dyn FnMut(&Rc<ShellRuntime>) -> bool>;
+thread_local! {
+    static SYNCHRONOUS_CLOSE: RefCell<Option<Vec<ClosingPoll>>> = const { RefCell::new(None) };
+}
+
+/// Quit destroys windows before polling foreground futures. This narrow pump
+/// settles host-module calls while the final call's window is still borrowed.
+pub(super) struct SynchronousClose;
+impl SynchronousClose {
+    pub(super) fn enter() -> Self {
+        SYNCHRONOUS_CLOSE.with_borrow_mut(|pending| {
+            assert!(pending.is_none(), "nested synchronous close");
+            *pending = Some(Vec::new());
+        });
+        Self
+    }
+}
+impl Drop for SynchronousClose {
+    fn drop(&mut self) {
+        SYNCHRONOUS_CLOSE.with_borrow_mut(|pending| { pending.take(); });
+    }
+}
+pub(super) fn poll_synchronous_close(runtime: &Rc<ShellRuntime>) {
+    let mut pending = SYNCHRONOUS_CLOSE.with_borrow_mut(|slot| {
+        slot.as_mut().map(std::mem::take).unwrap_or_default()
+    });
+    pending.retain_mut(|poll| !poll(runtime));
+    SYNCHRONOUS_CLOSE.with_borrow_mut(|slot| {
+        if let Some(slot) = slot { slot.extend(pending); }
+    });
+}
+
 const MAX_OUTSTANDING_TASKS_PER_RUNTIME: usize = 1024;
 
 fn register<'js>(ctx: &Ctx<'js>, task: TaskState) -> JsResult<Rc<TaskState>> {
@@ -1505,8 +1644,13 @@ fn owner_from_options<'js>(
         .and_then(|view| scope::with_current_app(|app| view.read(app).object().clone()))
         .and_then(|object| object.restore(ctx).ok())
         .is_some_and(|object| &object == owner);
+    // A reload runs the new build's `init` while the view still holds the old
+    // instance (it is swapped in only once init succeeds), so the instance
+    // being initialised is the running view too.
+    let is_initializing = current.is_some()
+        && scope::current_runtime().is_some_and(|runtime| runtime.is_initializing(ctx, owner));
 
-    if is_current {
+    if is_current || is_initializing {
         default()
     } else {
         Err(Exception::throw_type(

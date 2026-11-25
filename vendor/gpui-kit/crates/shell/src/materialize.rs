@@ -121,7 +121,7 @@ fn materialize_factory_subtree(
 use smallvec::SmallVec;
 
 use gpui::{
-    AbsoluteLength, AnyElement, App, Bounds, DefiniteLength, InteractiveElement, IntoElement,
+    AbsoluteLength, AnyElement, App, AppContext, Bounds, DefiniteLength, InteractiveElement, IntoElement,
     Length, MouseButton, ParentElement, Pixels, Refineable as _, SharedString,
     StatefulInteractiveElement, StyleRefinement, Styled, Window, div,
 };
@@ -250,6 +250,8 @@ impl<'a> ChildSpecs<'a> {
             );
         }
         let inherited = refinement.text.color.unwrap_or(self.inherited);
+        // HERDR: for hosted spinners (see `Spin`).
+        let _fade = Fade::enter(&refinement, &states);
         let children: Children = node
             .children()
             .iter()
@@ -306,6 +308,11 @@ impl StateStyles {
 
 #[derive(Default)]
 struct Behavior {
+    /// HERDR: `frames(list, ms)` and `loop(property, policy)` (see [`apply_loops`]).
+    frames: Option<(f64, Vec<String>)>,
+    loops: SmallVec<[Loop; 1]>,
+    /// HERDR: `spin(ms)`: an svg turning once every `ms`.
+    spin: Option<f64>,
     disabled: bool,
     selectable: Option<bool>,
     text_scrollable: Option<bool>,
@@ -369,8 +376,12 @@ struct Behavior {
     /// on an outside press through exactly this listener, and until now a
     /// script had no way to.
     on_mouse_down_out: Option<CallbackId>,
+    on_drop: Option<CallbackId>,
+    drag_paths: Option<crate::DraggedPaths>,
     /// Wheel and trackpad scrolling over this element.
     on_scroll_wheel: Option<CallbackId>,
+    /// A trackpad pinch over this element, on platforms that report one.
+    on_pinch: Option<CallbackId>,
     /// Handlers for named actions, one entry per action listened for.
     ///
     /// A list because an element that responds to actions usually responds to
@@ -435,6 +446,7 @@ struct Behavior {
     visible: Option<bool>,
     /// Reports the panel sizes of a resizable group once a drag has ended.
     on_resize: Option<CallbackId>,
+    on_size_change: Option<CallbackId>,
     /// Reports which item of a `VirtualList` was clicked.
     ///
     /// One handler for the whole list rather than one per row, and that is a
@@ -461,7 +473,7 @@ struct Behavior {
     ///
     /// [`DockChromeSlots`]: crate::dock::DockChromeSlots
     dock_chrome: crate::dock::DockChromeHooks,
-    /// The retained scroll position a `VirtualList` was told to drive.
+    /// The retained scroll position a plain area or `VirtualList` was told to drive.
     virtual_scroll: Option<crate::entities::EntityHandle>,
     /// This item's one-based position in its collection, and the collection's
     /// size — "tab 2 of 5". Announced, never drawn.
@@ -568,6 +580,8 @@ impl Behavior {
             || !self.on_mouse_up.is_empty()
             || self.on_mouse_down_out.is_some()
             || self.on_scroll_wheel.is_some()
+            || self.on_pinch.is_some()
+            || self.on_hover.is_some()
     }
 
     /// Whether focus or accessibility gave this element a reason to be
@@ -587,12 +601,15 @@ impl Behavior {
             || self.on_mouse_move.is_some()
             || self.on_hover.is_some()
             || self.on_key_down.is_some()
+            || self.on_drop.is_some()
+            || self.drag_paths.is_some()
             || self.on_key_up.is_some()
             || self.on_modifiers_changed.is_some()
             || !self.on_mouse_down.is_empty()
             || !self.on_mouse_up.is_empty()
             || self.on_mouse_down_out.is_some()
             || self.on_scroll_wheel.is_some()
+            || self.on_pinch.is_some()
             || !self.on_action.is_empty()
             || self.key_context.is_some()
     }
@@ -694,7 +711,19 @@ pub(crate) fn try_materialize(
     window: &mut Window,
     cx: &mut App,
 ) -> anyhow::Result<AnyElement> {
-    with_error_frame(|| materialize(runtime, snapshot, window, cx))
+    // HERDR: a check constructs elements once; it must not schedule animation frames.
+    CHECKING.with(|c| c.set(true));
+    let built = with_error_frame(|| materialize(runtime, snapshot, window, cx));
+    CHECKING.with(|c| c.set(false));
+    built
+}
+
+thread_local! {
+    static CHECKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn checking() -> bool {
+    CHECKING.with(|c| c.get())
 }
 
 /// Materializes one described subtree from an arena that is not a snapshot's.
@@ -755,6 +784,20 @@ fn materialize_node(
     let (mut refinement, behavior, states, motions, slot_specs) = resolve_ops(arena, node);
     let motion_identity = motion_element_id(id, behavior.key.clone(), &component);
     apply_motion(motion_identity, &motions, &mut refinement, window, cx);
+    let frame_text = apply_loops(&behavior, &mut refinement, window, cx);
+    // HERDR: for hosted spinners (see `Spin`).
+    let _fade = Fade::enter(&refinement, &states);
+    if matches!(
+        component,
+        Component::Popover(_)
+            | Component::HoverCard(_)
+            | Component::Popup(_)
+            | Component::Select(_)
+            | Component::Combobox(_)
+            | Component::DatePicker(..)
+    ) {
+        KEEP_INLINE.with(|o| o.set(true));
+    }
     let inherited = refinement.text.color.unwrap_or(inherited);
 
     // `SmallVec` rather than `Vec`: this runs per node, per frame, and the
@@ -765,7 +808,9 @@ fn materialize_node(
     // A component that takes typed children is handed the descriptions instead:
     // flattening them here would throw away the very thing it needs. See
     // [`ChildSpecs`].
-    let children: Children = if takes_typed_children(&component)
+    let children: Children = if let Some((current, list)) = frame_text {
+        smallvec::smallvec![SharedString::from(list[current].clone()).into_any_element()]
+    } else if takes_typed_children(&component)
         || matches!(component, Component::Registered(_))
     {
         Children::new()
@@ -1156,7 +1201,7 @@ fn materialize_component(
 
             let button = with_hover(button, &states);
             let button = with_active_and_focus(button, &states);
-            let button = components::tooltip::with_tooltip(button, &behavior);
+            let button = components::tooltip::with_tooltip(button, &behavior, window);
             let button = with_input_handlers(button, &behavior, runtime);
             finish(button, refinement, children)
         }
@@ -1399,9 +1444,23 @@ fn materialize_component(
             // accounts for this node's own `text_color`, so an explicit color
             // still wins and an icon in a dark button comes out light.
             warn_unhonoured_a11y(&behavior, "svg", &[]);
-            let mut image = gpui::svg().path(SharedString::from(path));
+            let path = crate::AppAssets::cache_key(&path);
+            // HERDR: `spin`.
+            if let Some(ms) = behavior.spin
+                && HOSTED.with(|h| h.get())
+                && !checking()
+            {
+                return spin_slot(window.current_view(), path, inherited, ms, &refinement);
+            }
+            let mut image = gpui::svg().path(path);
             image.style().refine(&refinement);
             image.style().text.color = Some(inherited);
+            if let Some(ms) = behavior.spin {
+                let turn = (loop_clock_ms() % ms) / ms;
+                image = image.with_transformation(gpui::Transformation::rotate(gpui::radians((turn * std::f64::consts::TAU) as f32)));
+                // ~10 fps: a small spinner looks the same, and each step redraws its whole view.
+                wake_view_after(Duration::from_millis(100), window, cx);
+            }
             image.into_any_element()
         }
         Component::Accordion(id) => {
@@ -1432,7 +1491,12 @@ fn materialize_component(
         Component::AvatarFallback => components::avatar::orphan("AvatarFallback"),
         Component::Image(path) => {
             warn_unhonoured_a11y(&behavior, "image", &[]);
-            let mut image = gpui::img(SharedString::from(path));
+            // HERDR: animated images need an identity to retain their frame state.
+            let mut source = gpui::ImageSource::from(path);
+            if let gpui::ImageSource::Resource(gpui::Resource::Embedded(path)) = &mut source {
+                *path = crate::AppAssets::cache_key(path);
+            }
+            let mut image = gpui::img(source).id(element_id(id, behavior.key.clone()));
             image.style().refine(&refinement);
             image.into_any_element()
         }
@@ -1540,6 +1604,10 @@ fn materialize_component(
         ),
         Component::Textarea(handle) => {
             components::textarea::textarea(runtime, handle, refinement, behavior, states, children)
+        }
+        // HERDR: retained source-code editor materialization.
+        Component::Editor(handle) => {
+            components::editor::editor(runtime, handle, refinement, behavior, states, children, cx)
         }
         Component::NumberInput(handle) => components::number_input::number_input(
             runtime, snapshot, arena, handle, inherited, refinement, behavior, states, slot_specs,
@@ -1724,9 +1792,23 @@ fn with_gpui_focus<E: InteractiveElement>(
 /// focus is.
 fn with_input_handlers<E>(element: E, behavior: &Behavior, runtime: &Rc<ShellRuntime>) -> E
 where
-    E: InteractiveElement + ParentElement,
+    E: StatefulInteractiveElement + ParentElement,
 {
     let mut element = element;
+    if let Some(paths) = &behavior.drag_paths {
+        element = element.on_drag(paths.clone(), |paths, cursor_offset, _, cx| {
+            cx.stop_propagation();
+            cx.new(|_| crate::drag_paths::DraggedPathsPreview { paths: paths.clone(), cursor_offset })
+        });
+    }
+    if let Some(callback) = behavior.on_drop {
+        let runtime = Rc::downgrade(runtime);
+        element = element.on_drop(move |paths: &gpui::ExternalPaths, window, cx| {
+            if let Some(runtime) = runtime.upgrade() {
+                runtime.dispatch_file_drop(callback, paths.paths(), window, cx);
+            }
+        });
+    }
     if let Some(callback) = behavior.on_key_down {
         let runtime = Rc::downgrade(runtime);
         element = element.on_key_down(move |event, window, cx| {
@@ -1758,6 +1840,19 @@ where
         let writer = Rc::clone(&bounds);
         element = element.on_prepaint(move |value, _, _| writer.set(Some(value)));
 
+        // HERDR: controls need the same hover callbacks as plain layout elements.
+        if let Some(callback) = behavior.on_hover {
+            let runtime = Rc::downgrade(runtime);
+            let bounds = Rc::clone(&bounds);
+            element = element.on_hover(move |hovered, window, cx| {
+                if !should_dispatch_hover(*hovered, bounds.get(), window.mouse_position()) {
+                    return;
+                }
+                if let Some(runtime) = runtime.upgrade() {
+                    runtime.dispatch_change(callback, *hovered, window, cx);
+                }
+            });
+        }
         for (button, callback) in behavior.on_mouse_down.iter().copied() {
             let runtime = Rc::downgrade(runtime);
             let bounds = Rc::clone(&bounds);
@@ -1777,6 +1872,16 @@ where
             let bounds = Rc::clone(&bounds);
             element = element.on_mouse_down_out(move |event, window, cx| {
                 dispatch_mouse_button(&runtime, callback, event, bounds.get(), window, cx);
+            });
+        }
+        if let Some(callback) = behavior.on_pinch {
+            let runtime = Rc::downgrade(runtime);
+            let bounds = Rc::clone(&bounds);
+            element = element.on_pinch(move |event, window, cx| {
+                let Some(runtime) = runtime.upgrade() else {
+                    return;
+                };
+                runtime.dispatch_pinch(callback, event, bounds.get(), window, cx);
             });
         }
         if let Some(callback) = behavior.on_scroll_wheel {
@@ -1938,6 +2043,8 @@ fn warn_unhonoured_input(component: &Component, behavior: &Behavior) {
     let asked = [
         ("on_key_down", behavior.on_key_down.is_some()),
         ("on_key_up", behavior.on_key_up.is_some()),
+        ("on_drop", behavior.on_drop.is_some()),
+        ("drag_paths", behavior.drag_paths.is_some()),
         (
             "on_modifiers_changed",
             behavior.on_modifiers_changed.is_some(),
@@ -1946,6 +2053,7 @@ fn warn_unhonoured_input(component: &Component, behavior: &Behavior) {
         ("on_mouse_up", !behavior.on_mouse_up.is_empty()),
         ("on_mouse_down_out", behavior.on_mouse_down_out.is_some()),
         ("on_scroll_wheel", behavior.on_scroll_wheel.is_some()),
+        ("on_pinch", behavior.on_pinch.is_some()),
         ("on_action", !behavior.on_action.is_empty()),
         ("key_context", behavior.key_context.is_some()),
     ];
@@ -2061,6 +2169,7 @@ fn flex_element(
         && !behavior.needs_identity()
         && behavior.on_click.is_none()
         && behavior.on_mouse_move.is_none()
+        && behavior.on_size_change.is_none()
         && behavior.on_hover.is_none()
         && behavior.on_key_down.is_none()
         && behavior.on_key_up.is_none()
@@ -2069,6 +2178,7 @@ fn flex_element(
         && behavior.on_mouse_up.is_empty()
         && behavior.on_mouse_down_out.is_none()
         && behavior.on_scroll_wheel.is_none()
+        && behavior.on_pinch.is_none()
         && behavior.on_action.is_empty()
         && behavior.key_context.is_none()
         && !behavior.scroll_x
@@ -2077,6 +2187,13 @@ fn flex_element(
         return finish(element, refinement, children);
     }
 
+    // Keep script child indices ahead of the invisible geometry observers
+    // installed by pointer handlers.
+    let (element, children) = if behavior.virtual_scroll.is_some() {
+        (element.children(children), Children::new())
+    } else {
+        (element, children)
+    };
     let scroll_x = behavior.scroll_x;
     let scroll_y = behavior.scroll_y;
     // A plain element has no focus or role of its own, so GPUI's builders are
@@ -2099,12 +2216,11 @@ fn flex_element(
             dispatch_click(&runtime, callback, event, window, cx);
         });
     }
-    let bounds = Rc::new(Cell::new(None::<Bounds<Pixels>>));
-    let bounds_writer = Rc::clone(&bounds);
-    let mut stateful = stateful.on_prepaint(move |value, _, _| bounds_writer.set(Some(value)));
     if let Some(callback) = behavior.on_mouse_move {
+        let bounds = Rc::new(Cell::new(None::<Bounds<Pixels>>));
+        let bounds_writer = Rc::clone(&bounds);
+        stateful = stateful.on_prepaint(move |value, _, _| bounds_writer.set(Some(value)));
         let runtime = Rc::downgrade(runtime);
-        let bounds = Rc::clone(&bounds);
         stateful = stateful.on_mouse_move(move |event, window, cx| {
             let Some(bounds) = bounds.get() else { return };
             let local = event.position - bounds.origin;
@@ -2113,35 +2229,31 @@ fn flex_element(
             }
         });
     }
-    if let Some(callback) = behavior.on_hover {
-        let runtime = Rc::downgrade(runtime);
-        let bounds = Rc::clone(&bounds);
-        stateful = stateful.on_hover(move |hovered, window, cx| {
-            if !should_dispatch_hover(*hovered, bounds.get(), window.mouse_position()) {
-                return;
-            }
-            if let Some(runtime) = runtime.upgrade() {
-                runtime.dispatch_change(callback, *hovered, window, cx);
-            }
-        });
-    }
-    let stateful = components::tooltip::with_tooltip(stateful, &behavior);
+    let stateful = components::tooltip::with_tooltip(stateful, &behavior, window);
+    let scroll_handle = behavior.virtual_scroll.and_then(|handle| runtime.entities().scroll(handle));
     if behavior.scrollbar {
         let mut stateful = stateful;
         stateful.style().refine(&refinement);
         stateful.extend(children);
-        return match (scroll_x, scroll_y) {
+        let element = match (scroll_x, scroll_y) {
             (true, true) => Scrollable::new(stateful, ScrollbarAxis::Both)
-                .id(identity)
+                .id(identity.clone())
+                .mode(behavior.scrollbar_mode)
+                .track_scroll(scroll_handle.clone())
                 .into_any_element(),
             (true, false) => Scrollable::new(stateful, ScrollbarAxis::Horizontal)
-                .id(identity)
+                .id(identity.clone())
+                .mode(behavior.scrollbar_mode)
+                .track_scroll(scroll_handle.clone())
                 .into_any_element(),
             (false, true) => Scrollable::new(stateful, ScrollbarAxis::Vertical)
-                .id(identity)
+                .id(identity.clone())
+                .mode(behavior.scrollbar_mode)
+                .track_scroll(scroll_handle.clone())
                 .into_any_element(),
             (false, false) => stateful.into_any_element(),
         };
+        return observe_size(element, identity, behavior.on_size_change, runtime, window, cx);
     }
     // The scroll position lives in window element state under this element's
     // own identity, which is the slot an explicit `Scrollbar` elsewhere in the
@@ -2150,20 +2262,88 @@ fn flex_element(
     // `Scrollable` owns a position of its own, on the inner area it builds.
     let stateful = match (scroll_x, scroll_y) {
         (true, true) => {
-            components::scrollbar::track_scroll_position(stateful, &identity, window, cx)
+            components::scrollbar::track_scroll_position(stateful, &identity, scroll_handle.clone(), window, cx)
                 .overflow_scroll()
         }
         (true, false) => {
-            components::scrollbar::track_scroll_position(stateful, &identity, window, cx)
+            components::scrollbar::track_scroll_position(stateful, &identity, scroll_handle.clone(), window, cx)
                 .overflow_x_scroll()
         }
         (false, true) => {
-            components::scrollbar::track_scroll_position(stateful, &identity, window, cx)
+            components::scrollbar::track_scroll_position(stateful, &identity, scroll_handle.clone(), window, cx)
                 .overflow_y_scroll()
         }
         (false, false) => stateful,
     };
-    finish(stateful, refinement, children)
+    observe_size(finish(stateful, refinement, children), identity, behavior.on_size_change, runtime, window, cx)
+}
+
+fn observe_size(
+    element: AnyElement, identity: gpui::ElementId, callback: Option<CallbackId>,
+    runtime: &Rc<ShellRuntime>, window: &mut Window, cx: &mut App,
+) -> AnyElement {
+    let Some(callback) = callback.filter(|_| !checking()) else { return element };
+    let last = window.use_keyed_state((identity, "size-change"), cx, |_, _| {
+        Rc::new(Cell::new(None::<(Option<u64>, gpui::Size<Pixels>)>))
+    }).read(cx).clone();
+    SizeObserver {
+        element, last, callback,
+        application: runtime.callback_application_id(callback),
+        runtime: Rc::downgrade(runtime),
+    }.into_any_element()
+}
+
+// Reuse the element's layout node: a full-size canvas child excludes its borders.
+struct SizeObserver {
+    element: AnyElement,
+    last: Rc<Cell<Option<(Option<u64>, gpui::Size<Pixels>)>>>,
+    application: Option<u64>,
+    callback: CallbackId,
+    runtime: Weak<ShellRuntime>,
+}
+
+impl IntoElement for SizeObserver {
+    type Element = Self;
+    fn into_element(self) -> Self { self }
+}
+
+impl gpui::Element for SizeObserver {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> { None }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> { None }
+
+    fn request_layout(
+        &mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>,
+        window: &mut Window, cx: &mut App,
+    ) -> (gpui::LayoutId, ()) {
+        (self.element.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>, _: &mut (), window: &mut Window, cx: &mut App,
+    ) {
+        self.element.prepaint(window, cx);
+        let current = (self.application, bounds.size);
+        if self.last.replace(Some(current)) != Some(current) {
+            let runtime = self.runtime.clone();
+            let callback = self.callback;
+            window.defer(cx, move |window, cx| {
+                if let Some(runtime) = runtime.upgrade() {
+                    runtime.dispatch_size_change(callback, bounds.size, window, cx);
+                }
+            });
+        }
+    }
+
+    fn paint(
+        &mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>, _: &mut (), _: &mut (), window: &mut Window, cx: &mut App,
+    ) {
+        self.element.paint(window, cx);
+    }
 }
 
 /// Whether a hover transition from this snapshot still describes the pointer.
@@ -2383,6 +2563,10 @@ fn motion_element_id(
         Component::Textarea(handle) => {
             gpui::ElementId::NamedInteger("gpui-shell-textarea".into(), *handle)
         }
+        // HERDR: stable identity across script editor renders.
+        Component::Editor(handle) => {
+            gpui::ElementId::NamedInteger("gpui-shell-editor".into(), *handle)
+        }
         Component::NumberInput(handle) => {
             gpui::ElementId::NamedInteger("gpui-shell-number-input".into(), *handle)
         }
@@ -2472,6 +2656,45 @@ pub(in crate::materialize) fn resolve_ops(
                     );
                 }
             }
+            SpecOp::Method("spin", args) => {
+                if let [Bridged::Number(ms)] = args.as_slice() {
+                    behavior.spin = Some(ms.max(100.0));
+                }
+            }
+            SpecOp::Method("frames", args) => {
+                if let [Bridged::Number(ms), list @ ..] = args.as_slice() {
+                    let list: Vec<String> = list
+                        .iter()
+                        .filter_map(|s| match s {
+                            Bridged::Str(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !list.is_empty() {
+                        behavior.frames = Some((ms.max(16.0), list));
+                    }
+                }
+            }
+            SpecOp::Method("loop", args) => {
+                if let [
+                    Bridged::Str(property),
+                    Bridged::Number(from),
+                    Bridged::Number(to),
+                    Bridged::Number(period),
+                    Bridged::Str(easing),
+                ] = args.as_slice()
+                    && let Some(property) = MotionProperty::parse(property)
+                {
+                    behavior.loops.retain(|l| l.property != property);
+                    behavior.loops.push(Loop {
+                        property,
+                        from: *from as f32,
+                        to: *to as f32,
+                        period: period.max(100.0),
+                        easing: easing.clone(),
+                    });
+                }
+            }
             SpecOp::Method(name, args) => {
                 if !matches!(
                     *name,
@@ -2525,8 +2748,11 @@ pub(in crate::materialize) fn resolve_ops(
                 "on_mouse_up_right" => behavior.on_mouse_up.push((MouseButton::Right, *id)),
                 "on_mouse_up_middle" => behavior.on_mouse_up.push((MouseButton::Middle, *id)),
                 "on_mouse_down_out" => behavior.on_mouse_down_out = Some(*id),
+                "on_drop" => behavior.on_drop = Some(*id),
                 "on_scroll_wheel" => behavior.on_scroll_wheel = Some(*id),
+                "on_pinch" => behavior.on_pinch = Some(*id),
                 "on_resize" => behavior.on_resize = Some(*id),
+                "on_size_change" => behavior.on_size_change = Some(*id),
                 "on_change" => behavior.on_change = Some(*id),
                 "token" => behavior.token = Some(*id),
                 "on_token_click" => behavior.on_token_click = Some(*id),
@@ -2558,6 +2784,238 @@ pub(in crate::materialize) fn resolve_ops(
     }
 
     (refinement, behavior, states, motions, slots)
+}
+
+// HERDR: looping animation, run here and never in the script. A view with a
+// loop asks to be drawn again when its next value is due (the next frame of
+// `frames`, ~30 fps for `loop`), so a spinner costs one native redraw of its
+// view per step and nothing while the view isn't drawn.
+struct Loop {
+    property: MotionProperty,
+    from: f32,
+    to: f32,
+    period: f64,
+    easing: String,
+}
+
+/// One clock for every view, so spinners in different mods turn together.
+fn loop_clock_ms() -> f64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
+thread_local! {
+    static LOOP_WAKES: RefCell<std::collections::HashMap<gpui::EntityId, std::time::Instant>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+// HERDR: a spinner in a view a ShellRoot shows is drawn by that ShellRoot.
+// The view lays out an empty slot that says where it is; ShellRoot paints it
+// turned, on top of its cached content, and wakes only itself. A step then
+// redraws ShellRoot's thin layers instead of rebuilding the whole view: GPUI
+// rebuilds everything under a cached view that changed, so a spinner that
+// woke its view cost the view's whole materialize, layout and paint 10 times
+// a second.
+// Painted above the whole view, a spinner would show through anything in the
+// view drawn over it, and keeps only the opacity it was built with: a view with
+// a popover, a select or the like, opacity that changes on hover, press or
+// focus (or an error banner, see ScriptView) keeps its spinners inline.
+#[derive(Clone)]
+struct Spin {
+    bounds: Bounds<Pixels>,
+    mask: gpui::ContentMask<Pixels>,
+    path: SharedString,
+    color: gpui::Hsla,
+    ms: f64,
+}
+
+thread_local! {
+    static SPINS: RefCell<std::collections::HashMap<gpui::EntityId, Vec<Spin>>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// Views ShellRoots show as their content.
+    static SHOWN: RefCell<std::collections::HashSet<gpui::EntityId>> =
+        RefCell::new(std::collections::HashSet::new());
+    /// Views whose last build had something that may cover a spinner.
+    static INLINE: RefCell<std::collections::HashSet<gpui::EntityId>> =
+        RefCell::new(std::collections::HashSet::new());
+    static HOSTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static KEEP_INLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The opacity the node being built is painted with (its ancestors' and its own).
+    static FADE: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+/// A ShellRoot shows `view` as its content (and draws its spinners).
+pub(crate) fn show_spins_of(view: gpui::EntityId) {
+    SHOWN.with(|s| s.borrow_mut().insert(view));
+}
+
+pub(crate) fn forget_spins(view: gpui::EntityId) {
+    SPINS.with(|s| s.borrow_mut().remove(&view));
+    SHOWN.with(|s| s.borrow_mut().remove(&view));
+    INLINE.with(|s| s.borrow_mut().remove(&view));
+}
+
+/// Materializes `view`; `may_host`: its spinners may be left to its ShellRoot's
+/// [`spin_layer`]. True when it must be built again at once: something that
+/// may cover a spinner appeared, so they go back inline.
+pub(crate) fn build_view<T>(view: gpui::EntityId, may_host: bool, build: impl FnOnce() -> T) -> (T, bool) {
+    let hosted = may_host
+        && SHOWN.with(|s| s.borrow().contains(&view))
+        && !INLINE.with(|s| s.borrow().contains(&view));
+    SPINS.with(|s| s.borrow_mut().remove(&view));
+    HOSTED.with(|h| h.set(hosted));
+    KEEP_INLINE.with(|o| o.set(false));
+    let built = build();
+    HOSTED.with(|h| h.set(false));
+    let inline = KEEP_INLINE.with(|o| o.get());
+    INLINE.with(|s| if inline { s.borrow_mut().insert(view) } else { s.borrow_mut().remove(&view) });
+    (built, hosted && inline)
+}
+
+/// Builds the view being rendered again on the next frame.
+pub(crate) fn wake_view_now(window: &Window, cx: &mut App) {
+    wake_view_after(Duration::ZERO, window, cx);
+}
+
+/// While a node is built: the opacity it's painted with, for a spinner in it.
+struct Fade(f32);
+
+impl Fade {
+    fn enter(refinement: &StyleRefinement, states: &StateStyles) -> Self {
+        let changes = |s: &Option<StyleRefinement>| s.as_ref().is_some_and(|s| s.opacity.is_some() || s.visibility.is_some());
+        if changes(&states.hover) || changes(&states.active) || changes(&states.focus) {
+            KEEP_INLINE.with(|o| o.set(true));
+        }
+        let hidden = refinement.visibility == Some(gpui::Visibility::Hidden);
+        let own = if hidden { 0.0 } else { refinement.opacity.unwrap_or(1.0) };
+        Fade(FADE.with(|f| f.replace(f.get() * own)))
+    }
+}
+
+impl Drop for Fade {
+    fn drop(&mut self) {
+        FADE.with(|f| f.set(self.0));
+    }
+}
+
+fn spin_slot(
+    view: gpui::EntityId,
+    path: SharedString,
+    color: gpui::Hsla,
+    ms: f64,
+    refinement: &StyleRefinement,
+) -> AnyElement {
+    let color = color.opacity(FADE.with(|f| f.get()));
+    let mut slot = gpui::canvas(
+        move |bounds, window, _| {
+            let spin = Spin { bounds, mask: window.content_mask(), path, color, ms };
+            SPINS.with(|s| s.borrow_mut().entry(view).or_default().push(spin));
+        },
+        |_, _, _, _| {},
+    );
+    slot.style().refine(refinement);
+    slot.into_any_element()
+}
+
+/// `view`'s spinners, turned to now; while there are any, the view this is
+/// drawn in (a ShellRoot) is woken for the next step.
+pub(crate) fn spin_layer(view: gpui::EntityId) -> AnyElement {
+    gpui::canvas(
+        |_, _, _| {},
+        move |_, _, window, cx| {
+            let spins = SPINS.with(|s| s.borrow().get(&view).cloned()).unwrap_or_default();
+            if spins.is_empty() || INLINE.with(|s| s.borrow().contains(&view)) {
+                return;
+            }
+            let scale = window.scale_factor();
+            for s in spins {
+                let turn = (loop_clock_ms() % s.ms) / s.ms;
+                let center = s.bounds.center();
+                let matrix = gpui::TransformationMatrix::unit()
+                    .translate(center.scale(scale))
+                    .rotate(gpui::radians((turn * std::f64::consts::TAU) as f32))
+                    .translate(center.scale(-scale));
+                window.with_content_mask(Some(s.mask), |window| {
+                    let _ = window.paint_svg(s.bounds, s.path, None, matrix, s.color, cx);
+                });
+            }
+            wake_view_after(Duration::from_millis(100), window, cx);
+        },
+    )
+    .absolute()
+    .size_full()
+    .into_any_element()
+}
+
+/// Draws the view being rendered again after `delay`, once, however many of
+/// its elements ask.
+fn wake_view_after(delay: Duration, window: &Window, cx: &mut App) {
+    if checking() {
+        return;
+    }
+    let view = window.current_view();
+    let now = std::time::Instant::now();
+    let at = now + delay;
+    let schedule = LOOP_WAKES.with(|wakes| {
+        let mut wakes = wakes.borrow_mut();
+        match wakes.get(&view) {
+            Some(pending) if *pending > now && *pending <= at => false,
+            _ => {
+                wakes.insert(view, at);
+                true
+            }
+        }
+    });
+    if !schedule {
+        return;
+    }
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(delay).await;
+        LOOP_WAKES.with(|wakes| {
+            let mut wakes = wakes.borrow_mut();
+            if wakes.get(&view) == Some(&at) {
+                wakes.remove(&view);
+            }
+        });
+        cx.update(|cx| cx.notify(view));
+    })
+    .detach();
+}
+
+/// Applies `loop`s to the refinement; with `frames`, returns the frames and
+/// which one shows now.
+fn apply_loops<'a>(behavior: &'a Behavior, refinement: &mut StyleRefinement, window: &Window, cx: &mut App) -> Option<(usize, &'a [String])> {
+    if behavior.frames.is_none() && behavior.loops.is_empty() {
+        return None;
+    }
+    let now = loop_clock_ms();
+    let mut next = f64::INFINITY;
+    let text = behavior.frames.as_ref().map(|(ms, list)| {
+        let step = (now / ms).floor();
+        next = next.min((step + 1.0) * ms - now);
+        ((step as usize) % list.len(), list.as_slice())
+    });
+    for l in &behavior.loops {
+        let phase = (now % l.period) / l.period;
+        let x = if phase < 0.5 { phase * 2.0 } else { 2.0 - phase * 2.0 } as f32;
+        let eased = match l.easing.as_str() {
+            "linear" => x,
+            "ease-in" => ease_in_cubic(x),
+            "ease-out" => ease_out_cubic(x),
+            _ => ease_in_out_cubic(x),
+        };
+        let value = l.from + (l.to - l.from) * eased;
+        match l.property {
+            MotionProperty::Opacity => refinement.opacity = Some(value.clamp(0.0, 1.0)),
+            MotionProperty::Width => refinement.size.width = Some(gpui::px(value).into()),
+            MotionProperty::Height => refinement.size.height = Some(gpui::px(value).into()),
+            MotionProperty::Left => refinement.inset.left = Some(gpui::px(value).into()),
+            MotionProperty::Top => refinement.inset.top = Some(gpui::px(value).into()),
+        }
+        next = next.min(1000.0 / 30.0);
+    }
+    wake_view_after(Duration::from_secs_f64(next.max(1.0) / 1000.0), window, cx);
+    text
 }
 
 fn set_motion(motions: &mut SmallVec<[Motion; 2]>, motion: Motion) {
@@ -2989,6 +3447,10 @@ fn apply_behavior(behavior: &mut Behavior, name: &str, args: &[Bridged]) {
                 .first()
                 .and_then(|value| value.as_str().ok())
                 .map(SharedString::from);
+        }
+        "drag_paths" => {
+            behavior.drag_paths = args.first().and_then(|v| v.as_str().ok())
+                .and_then(|v| serde_json::from_str(v).ok());
         }
         "href" => {
             behavior.href = args

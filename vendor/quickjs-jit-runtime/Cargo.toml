@@ -1,3 +1,6 @@
+# HERDR: quickjs-jit's `jit` crate at our pinned rev 96593cd with
+# longbridge/quickjs-jit#38 applied (src/lib.rs, marked HERDR:). Only the
+# library: tests, benches and binaries stay upstream. Drop once merged.
 [package]
 name = "quickjs-jit-runtime"
 version = "0.12.11"
@@ -8,16 +11,20 @@ license = "MIT"
 description = "Tiered JIT runtime for the quickjs-jit distribution"
 repository = "https://github.com/longbridge/rquickjs.git"
 build = "build.rs"
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
 
 [lib]
 name = "rquickjs_jit"
 
 [build-dependencies]
-rquickjs-sys = { package = "quickjs-jit-sys", version = "=0.12.11", path = "../sys", features = ["jit-abi"] }
+rquickjs-sys = { package = "quickjs-jit-sys", version = "=0.12.11", git = "https://github.com/longbridge/quickjs-jit", rev = "96593cd7a54440ac060a391b8baea7e9a3cf1393", features = ["jit-abi"] }
 
 [dependencies]
 rustc-hash = "2.1"
-rquickjs-core = { package = "quickjs-jit-core", version = "=0.12.11", path = "../core", features = ["jit-abi", "loader"] }
+rquickjs-core = { package = "quickjs-jit-core", version = "=0.12.11", git = "https://github.com/longbridge/quickjs-jit", rev = "96593cd7a54440ac060a391b8baea7e9a3cf1393", features = ["jit-abi", "loader"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -45,28 +52,6 @@ gimli = { version = "0.31", optional = true, default-features = false, features 
 postcard = { version = "1", optional = true, default-features = false, features = ["alloc"] }
 target-lexicon = { version = "0.13", optional = true }
 
-[dev-dependencies]
-criterion = "0.5"
-rquickjs = { package = "quickjs-jit", path = "..", features = ["jit-abi", "loader"] }
-static_assertions = "1"
-trybuild = "1"
-
-[[bin]]
-name = "jit-test262"
-required-features = ["test-support"]
-
-[[bench]]
-name = "micro"
-harness = false
-
-[[bench]]
-name = "algorithms"
-harness = false
-
-[[bench]]
-name = "tiering"
-harness = false
-
 [features]
 default = []
 bindgen = ["rquickjs-core/bindgen"]
@@ -82,135 +67,3 @@ compiler = [
   "dep:target-lexicon",
 ]
 test-support = ["rquickjs-core/jit-test-support"]
-
-[[test]]
-name = "helpers"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "semantics"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "gpui_shell_surface"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "opcodes"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "differential"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "optimized"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "property_specialization"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "polymorphic_property_ic"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "speculative_numeric"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "call_guard_licm"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "semantic_heap"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "generic_call_cleanup"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "property_cache"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "array_semantics"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "return_ownership"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "array_feedback"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "frame_inline"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "tagged_call_link"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "profitability_backoff"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "deopt"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "background"
-required-features = ["test-support"]
-
-[[test]]
-name = "osr"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "tier1_arrays_typed"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "tier1_calls_properties"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "tier1_globals"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "tier1_closures"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "tier1_constructors"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "tier1_regexp"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "tier1_generic_ops"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "untranslatable_settle"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "tier1_iteration"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "tier2_tdz"
-required-features = ["compiler", "test-support"]
-
-[[test]]
-name = "test262"
-required-features = ["compiler", "test-support"]

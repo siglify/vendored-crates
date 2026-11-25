@@ -49,6 +49,28 @@ impl fmt::Display for ClientError {
 #[cfg(feature = "std")]
 impl std::error::Error for ClientError {}
 
+// HERDR: malformed or unsupported input from an XIM server must not close the app.
+fn decode_text(bytes: &[u8]) -> String {
+    xim_ctext::compound_text_to_utf8(bytes).unwrap_or_else(|error| {
+        log::warn!("Invalid XIM COMPOUND_TEXT: {}", error);
+        String::from_utf8_lossy(bytes).into_owned()
+    })
+}
+
+#[cfg(test)]
+mod decoding_tests {
+    #[test]
+    fn malformed_server_text_is_lossy_not_fatal() {
+        assert_eq!(super::decode_text(b"\xb4"), "´");
+        assert_eq!(super::decode_text(b"\x1b-Z\xff"), "\x1b-Z\u{fffd}");
+        assert_eq!(super::decode_text(b"\x1b%G"), "");
+        assert_eq!(
+            super::decode_text(b"\x1b%G\xff\x1b%@"),
+            "\x1b%G\u{fffd}\x1b%@"
+        );
+    }
+}
+
 pub fn handle_request<C: ClientCore>(
     client: &mut C,
     handler: &mut impl ClientHandler<C>,
@@ -140,9 +162,9 @@ pub fn handle_request<C: ClientCore>(
             input_context_id,
             preedit_string,
         } => {
-            let preedit_string =
-                xim_ctext::compound_text_to_utf8(&preedit_string).expect("Encoding error");
-            handler.handle_reset_ic(client, input_method_id, input_context_id, &preedit_string);
+            let preedit_string = decode_text(&preedit_string);
+            let _ =
+                handler.handle_reset_ic(client, input_method_id, input_context_id, &preedit_string);
             Ok(())
         }
         Request::Error { code, detail, .. } => Err(ClientError::XimError(code, detail)),
@@ -187,7 +209,7 @@ pub fn handle_request<C: ClientCore>(
                     client,
                     input_method_id,
                     input_context_id,
-                    &xim_ctext::compound_text_to_utf8(&commited).expect("Encoding Error"),
+                    &decode_text(&commited),
                 )?;
 
                 if syncronous {
@@ -233,8 +255,7 @@ pub fn handle_request<C: ClientCore>(
             status,
             feedbacks,
         } => {
-            let preedit_string =
-                xim_ctext::compound_text_to_utf8(&preedit_string).expect("Encoding Error");
+            let preedit_string = decode_text(&preedit_string);
             handler.handle_preedit_draw(
                 client,
                 input_method_id,
@@ -292,8 +313,8 @@ pub trait ClientCore {
 pub trait Client {
     type XEvent;
 
-    fn build_ic_attributes(&self) -> AttributeBuilder;
-    fn build_im_attributes(&self) -> AttributeBuilder;
+    fn build_ic_attributes(&self) -> AttributeBuilder<'_>;
+    fn build_im_attributes(&self) -> AttributeBuilder<'_>;
 
     fn disconnect(&mut self) -> Result<(), ClientError>;
     fn open(&mut self, locale: &str) -> Result<(), ClientError>;
@@ -347,11 +368,11 @@ where
 {
     type XEvent = C::XEvent;
 
-    fn build_ic_attributes(&self) -> AttributeBuilder {
+    fn build_ic_attributes(&self) -> AttributeBuilder<'_> {
         AttributeBuilder::new(self.ic_attributes())
     }
 
-    fn build_im_attributes(&self) -> AttributeBuilder {
+    fn build_im_attributes(&self) -> AttributeBuilder<'_> {
         AttributeBuilder::new(self.im_attributes())
     }
 

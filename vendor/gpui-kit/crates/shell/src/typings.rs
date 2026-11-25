@@ -1076,6 +1076,11 @@ const CONTEXT_AND_VIEW: &str = r#"  /**
    * resolves whichever is running when a member is used, and refuses only when
    * none is.
    *
+   * The one handed to a `cx.spawn` or `cx.timer` callback belongs to the
+   * task's owner: `cx.notify()` redraws that view even when another view's
+   * call woke the task. It throws once its build of the script is reloaded or
+   * closed, so a replaced build's loop ends at its next `cx` use.
+   *
    * It is what `init` receives, and what `cx.spawn` and `cx.timer` hand their
    * callbacks — the three places whose whole job is to set up or continue work
    * that outlives the call they were started from.
@@ -1189,6 +1194,17 @@ const CONTEXT_AND_VIEW: &str = r#"  /**
     context?: string;
   }
 
+  /** What an `on_pinch` handler receives. */
+  export interface PinchEvent {
+    /** The change in scale for this step: 0.1 is 10% larger, negative is smaller. */
+    delta: number;
+    touch_phase: "started" | "moved" | "ended" | "cancelled";
+    position: Point;
+    local_position?: Point;
+    bounds?: import("gpui-shell").ElementBounds;
+    modifiers: Modifiers;
+  }
+
   /** What an `on_scroll_wheel` handler receives. */
   export interface ScrollWheelEvent {
     /** The scroll distance in pixels, whichever unit the device reported. */
@@ -1222,6 +1238,12 @@ const CONTEXT_AND_VIEW: &str = r#"  /**
     init?(props: import("gpui-shell").Props | undefined, cx: AsyncContext): void;
     /** Runs when a parent changes this retained nested view's properties. */
     update?(props: import("gpui-shell").Props | undefined): void;
+    /** Application root only: one final call when the host closes this copy.
+     * Start cleanup here, rather than awaiting earlier work. At quit, newly
+     * started exec calls, terminal.kill commands and cx.sleep can finish within
+     * the host's short deadline; other commands may not run.
+     * Hiding a copy or switching tabs does not close it. */
+    close?(cx: AsyncContext): void | Promise<void>;
     abstract render(cx: Context): Element | Entity | string;
   }
 
@@ -1383,6 +1405,9 @@ const ELEMENT_METHODS: &str = r#"    /**
     on_click<Self extends Element>(this: Self, handler: (event: ClickEvent, cx: Context) => void): Self;
     /** GPUI `InteractiveElement::on_mouse_move`, delivered while this element is hovered. */
     on_mouse_move<Self extends Element>(this: Self, handler: (event: MouseMoveEvent, cx: Context) => void): Self;
+    /** div/h_flex/v_flex: initial size and changed layout size, in logical pixels.
+     * Runs after layout, even without pointer movement. Use a stable id. */
+    on_size_change<Self extends Element>(this: Self, handler: (size: { width: number; height: number }, cx: Context) => void): Self;
     /** GPUI `InteractiveElement::on_hover`; reports both pointer entry and exit. */
     on_hover<Self extends Element>(this: Self, handler: (hovered: boolean, cx: Context) => void): Self;
     /**
@@ -1440,6 +1465,14 @@ const ELEMENT_METHODS: &str = r#"    /**
      */
     on_mouse_down_out<Self extends Element>(this: Self, handler: (event: MouseButtonEvent, cx: Context) => void): Self;
     /**
+     * Makes a plain layout element a native file/folder drag source. Paths are
+     * absolute on `on` (a host-owned machine name); omitted/null means local.
+     * The payload keeps its source machine, and an ordinary click still works.
+     */
+    drag_paths<Self extends Element>(this: Self, paths: string[], options?: { on?: string | null }): Self;
+    /** Files dropped from outside the app, as absolute paths. Use on a plain layout element. */
+    on_drop<Self extends Element>(this: Self, handler: (event: { paths: string[] }, cx: Context) => void): Self;
+    /**
      * GPUI `InteractiveElement::on_scroll_wheel`: wheel and trackpad scrolling
      * over this element.
      *
@@ -1448,6 +1481,11 @@ const ELEMENT_METHODS: &str = r#"    /**
      * the gesture drives something else — a zoom, a value, a custom viewport.
      */
     on_scroll_wheel<Self extends Element>(this: Self, handler: (event: ScrollWheelEvent, cx: Context) => void): Self;
+    /**
+     * GPUI `InteractiveElement::on_pinch`: a two-finger trackpad pinch over
+     * this element, on platforms that report one.
+     */
+    on_pinch<Self extends Element>(this: Self, handler: (event: PinchEvent, cx: Context) => void): Self;
     /**
      * `handler(event, cx)` when the named action is dispatched to this element
      * or to something inside it.
@@ -1682,15 +1720,21 @@ const ELEMENT_METHODS: &str = r#"    /**
      */
     track_focus<Self extends Element>(this: Self, handle: FocusHandle): Self;
     /**
-     * Gives a virtual list the scroll position held by a
+     * Gives a plain overflow scroll area the position held by a `ScrollHandle`,
+     * or gives a virtual list the scroll position held by a
      * `VirtualListScrollHandle`, so the script can drive it with
      * `scroll_to_item` and `scroll_to_bottom`.
      *
      * Optional. Without one the list keeps a position of its own, filed under
      * the id it was built with — which is the same place a `Scrollbar` named
      * after that id looks, so the bar works either way.
+     *
+     * `list` and `uniform_list` always keep their own position: a handle
+     * passed to them is ignored (the app logs a warning), so pair a
+     * `Scrollbar` of the same name instead. `v_virtual_list` and
+     * `h_virtual_list` use the handle.
      */
-    track_scroll<Self extends Element>(this: Self, handle: import("gpui-base").VirtualListScrollHandle): Self;
+    track_scroll<Self extends Element>(this: Self, handle: import("gpui-base").VirtualListScrollHandle | import("gpui-base").ScrollHandle): Self;
     /**
      * Which item a virtual list measures to infer its size across the axis it
      * scrolls: a vertical list takes its width from this item, a horizontal
@@ -1858,6 +1902,22 @@ const ELEMENT_METHODS: &str = r#"    /**
     transition<Self extends Element>(this: Self, property: import("gpui-shell").MotionProperty, policy: number | import("gpui-shell").TransitionPolicy): Self;
     /** Springs later target changes entirely in native GPUI code. */
     spring<Self extends Element>(this: Self, property: import("gpui-shell").MotionProperty, policy?: import("gpui-shell").SpringPolicy): Self;
+    /**
+     * Shows each string in turn as this element's text, `ms` apart, forever: a
+     * spinner. Runs natively (render never runs for it) and only while drawn;
+     * every view shares one clock. `ms` at least 16.
+     */
+    frames<Self extends Element>(this: Self, list: string[], ms: number): Self;
+    /**
+     * Swings a property between `from` and `to` and back every `period` ms,
+     * forever (a pulse). Runs natively at about 30 fps, only while drawn.
+     */
+    loop<Self extends Element>(this: Self, property: import("gpui-shell").MotionProperty, policy: import("gpui-shell").LoopPolicy): Self;
+    /**
+     * Turns an `svg` once every `ms`, forever (a spinner: draw an arc).
+     * Runs natively at about 30 fps, only while drawn. `ms` at least 100.
+     */
+    spin<Self extends Element>(this: Self, ms: number): Self;
 
     /**
      * Which thumb of a range slider a `SliderThumb` is: the one at the start
@@ -1997,7 +2057,8 @@ const SHELL_TYPES: &str = r#"  /** A path coordinate in pixels or as a percentag
   }
 
   export interface TaskOptions {
-    /** Defaults to the running view; `null` outlives every view. */
+    /** Defaults to the running view (in `init`, the view being set up, also
+     * during a reload); `null` outlives every view. */
     owner?: import("gpui-kit").View | null;
   }
 
@@ -2008,6 +2069,14 @@ const SHELL_TYPES: &str = r#"  /** A path coordinate in pixels or as a percentag
     duration: number;
     /** Delay in milliseconds. */
     delay?: number;
+    easing?: MotionEasing;
+  }
+  export interface LoopPolicy {
+    from: number;
+    to: number;
+    /** Milliseconds for there and back; default 1000, at least 100. */
+    period?: number;
+    /** Default ease-in-out. */
     easing?: MotionEasing;
   }
   export interface SpringPolicy {
@@ -2054,6 +2123,11 @@ const ELEMENTS: &str = r#"
 
   /**
    * GPUI's own lazy list: rows of any height, measured as they are drawn.
+   *
+   * Exported from `gpui-kit`, where `div` is — not from `gpui-base`. The
+   * `gpui-base` pair is `v_virtual_list` / `h_virtual_list`. Like every lazy
+   * list, it needs a definite height from its container: a `flex_1()` chain
+   * with no explicit height anywhere lays out at zero and draws nothing.
    *
    * Where `v_virtual_list` places rows by the sizes the script states, `list`
    * asks nothing about size. `render(index, cx)` is called for each item that
@@ -2103,6 +2177,10 @@ const ELEMENTS: &str = r#"
   /**
    * GPUI's own uniform list: one row is measured and every row takes its
    * height.
+   *
+   * Exported from `gpui-kit`, same as `list`; the `gpui-base` pair is
+   * `v_virtual_list` / `h_virtual_list`. It needs a definite height from its
+   * container too.
    *
    * The same contract as `v_virtual_list` with a single size, without the
    * size: the first row (or the one `with_item_to_measure_index` names) is
@@ -2963,6 +3041,20 @@ const BASE: &str = r#"  /** A row. */
     render: (range: ItemRange, cx: Context) => Element[],
   ): NativeElement;
 
+  /** A plain scroll area's position. Create in init() and attach with track_scroll. */
+  export interface ScrollHandle {
+    /** Reveal the zero-based direct child with the smallest scroll needed.
+     * Works on plain overflow_*_scroll and overflow_*_scrollbar elements.
+     * Requests are consumed once, after layout; already visible children stay put.
+     */
+    scroll_to_item(index: number): void;
+    /** Releases the handle. Using it afterwards throws. */
+    release(): boolean;
+  }
+
+  /** Create in init() and attach with track_scroll(handle). */
+  export const ScrollHandle: { new: () => ScrollHandle };
+
   /**
    * A virtual list's scroll position, kept across frames so the script can move
    * it. Create it in `init()` and hand it to the list with `track_scroll`.
@@ -2976,6 +3068,10 @@ const BASE: &str = r#"  /** A row. */
      * default) brings it to the near edge, `"center"` to the middle.
      */
     scroll_to_item(index: number, strategy?: "top" | "center"): void;
+    /**
+     * Puts the last item on screen before the next frame: the last of the items
+     * that frame draws, so it can be called in `init()` or right after adding items.
+     */
     scroll_to_bottom(): void;
     /** Releases the handle. Using it afterwards throws. */
     release(): boolean;
@@ -3006,12 +3102,14 @@ const BASE: &str = r#"  /** A row. */
     replace_with_token(token: InlineToken): void;
     replace_range_with_token(range: InputRange, token: InlineToken): void;
     set_selected_range(range: InputRange): void;
+    /** The selection (UTF-16 offsets); start equals end at a plain cursor. */
+    selected_range(): InputRange;
     replace(text: string): void;
     value(): string;
     /** Plain text, or a content snapshot to restore its tokens as well. */
     set_value(next: string | InputContent): void;
-    /** `change`, `submit`, `focus` or `blur`. */
-    on(event: "change" | "submit" | "focus" | "blur", handler: (event: InputEvent, cx: Context) => void): boolean;
+    /** `change`, `submit`, `focus`, `blur`, or `paste_other`: a paste found no text (an image, say). */
+    on(event: "change" | "submit" | "focus" | "blur" | "paste_other", handler: (event: InputEvent, cx: Context) => void): boolean;
     /**
      * How much one step moves the value in a `NumberInput`. Default is 1;
      * `null` gives up stepping entirely.
@@ -3029,6 +3127,8 @@ const BASE: &str = r#"  /** A row. */
     set_masked(masked: boolean): void;
     /** Marks the state as working; the presentation is the application's. */
     set_loading(loading: boolean): void;
+    /** Moves the keyboard onto the input. */
+    focus(): void;
     release(): boolean;
   }
 
@@ -3073,18 +3173,22 @@ const BASE: &str = r#"  /** A row. */
     replace_with_token(token: InlineToken): void;
     replace_range_with_token(range: InputRange, token: InlineToken): void;
     set_selected_range(range: InputRange): void;
+    /** The selection (UTF-16 offsets); start equals end at a plain cursor. */
+    selected_range(): InputRange;
     replace(text: string): void;
     value(): string;
     /** Plain text, or a content snapshot to restore its tokens as well. */
     set_value(next: string | InputContent): void;
-    /** `change`, `submit`, `focus` or `blur`. */
-    on(event: "change" | "submit" | "focus" | "blur", handler: (event: InputEvent, cx: Context) => void): boolean;
+    /** `change`, `submit`, `focus`, `blur`, or `paste_other`: a paste found no text (an image, say). */
+    on(event: "change" | "submit" | "focus" | "blur" | "paste_other", handler: (event: InputEvent, cx: Context) => void): boolean;
     /** Shows this many rows. */
     set_rows(rows: number): void;
     /** Grows with the content, between the two row counts. */
     set_auto_grow(min_rows: number, max_rows: number): void;
     /** Wraps long lines instead of scrolling sideways. Default is on. */
     set_soft_wrap(wrap: boolean): void;
+    /** Moves the keyboard onto the textarea. */
+    focus(): void;
     release(): boolean;
   }
 
@@ -3094,6 +3198,45 @@ const BASE: &str = r#"  /** A row. */
 
   /** The frame around retained multi-line text state. */
   export const Textarea: { new: (state: TextareaState) => NativeElement };
+
+  // HERDR: built-in source editing and read-only code viewing.
+  export interface EditorState {
+    value(): string;
+    /** Programmatic replacement works even in readonly mode. */
+    set_value(value: string): void;
+    /** The selection (UTF-16 offsets); start equals end at a plain cursor. */
+    selected_range(): InputRange;
+    set_selected_range(range: InputRange): void;
+    /** Replaces the selection with `text`, as typing would (one undo step). */
+    replace(text: string): void;
+    on(event: "change" | "submit" | "focus" | "blur" | "paste_other", handler: (event: InputEvent, cx: Context) => void): boolean;
+    /** Moves the keyboard onto the editor. */
+    focus(): void;
+    release(): boolean;
+  }
+  export const EditorState: {
+    new: (options?: {
+      language?: string;
+      value?: string;
+      /** HERDR: concrete code font; defaults to the shell theme's mono font. */
+      font_family?: string;
+      /** Font size in pixels; defaults to the theme's mono_md size. */
+      font_size?: number;
+      /** Defaults to true. */
+      line_numbers?: boolean;
+      /** Defaults to true; brace-based fold candidates. */
+      folding?: boolean;
+      /** Rejects user edits, but allows selection and copy. */
+      readonly?: boolean;
+      /** Defaults to false. */
+      soft_wrap?: boolean;
+      /** Semantic colors: keyword, string, comment, function, type, number,
+       * constant, variable, operator, punctuation, boolean, string.escape.
+       * Values are concrete hex colors; unspecified UI colors follow the theme. */
+      syntax?: Record<string, string>;
+    }) => EditorState;
+  };
+  export const Editor: { new: (state: EditorState) => NativeElement };
 
   /** One thumb, or the two ends of a range. */
   export type SliderValue = number | [number, number];
@@ -3906,7 +4049,10 @@ mod tests {
         "on_mouse_down",
         "on_mouse_up",
         "on_mouse_down_out",
+        "on_drop",
+        "drag_paths",
         "on_scroll_wheel",
+        "on_pinch",
         "on_action",
         "key_context",
         "image",
@@ -3982,6 +4128,9 @@ mod tests {
         "close_delay",
         "transition",
         "spring",
+        "frames",
+        "loop",
+        "spin",
         "hover",
         "active",
         "focus",

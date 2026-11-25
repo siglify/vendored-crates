@@ -28,7 +28,8 @@ use gpui::{App, AppContext as _, Entity, EntityId, FocusHandle, Subscription, Wi
 use gpui_base::VirtualListScrollHandle;
 use gpui_base::dock::{DockArea, DockEvent};
 use gpui_base::input::{
-    InputBaseState, InputEditorStyle, InputEvent, InputModeKind, InputState, TextareaState,
+    EditorState, InputBaseState, InputEditorStyle, InputEvent, InputModeKind, InputState,
+    TextareaState,
 };
 use gpui_base::slider::{SliderEvent, SliderScale, SliderState, SliderValue};
 use gpui_base::{CalendarEvent, CalendarState, OtpEvent, OtpState};
@@ -82,6 +83,15 @@ enum Record {
     /// methods, which is why everything below this point treats them together.
     Textarea {
         state: Entity<TextareaState>,
+        application: Option<Rc<ApplicationGeneration>>,
+        subscriptions: Vec<Subscription>,
+    },
+    // HERDR: retained code-editor state has the same ownership and events as textareas.
+    Editor {
+        state: Entity<EditorState>,
+        // HERDR: presentation overrides stay with the retained script editor.
+        font_family: Option<String>,
+        font_size: Option<f32>,
         application: Option<Rc<ApplicationGeneration>>,
         subscriptions: Vec<Subscription>,
     },
@@ -147,6 +157,10 @@ enum Record {
         application: Option<Rc<ApplicationGeneration>>,
         subscriptions: Vec<Subscription>,
     },
+    Scroll {
+        handle: PlainScrollHandle,
+        application: Option<Rc<ApplicationGeneration>>,
+    },
     /// The scroll position of a virtualized list, and the item it has been
     /// asked to scroll to.
     ///
@@ -159,6 +173,44 @@ enum Record {
         handle: VirtualListScrollHandle,
         application: Option<Rc<ApplicationGeneration>>,
     },
+}
+
+/// A plain scroll area's position and a request consumed during its next layout.
+#[derive(Clone, Default)]
+pub(crate) struct PlainScrollHandle {
+    pub(crate) handle: gpui::ScrollHandle,
+    pub(crate) pending: Rc<Cell<Option<usize>>>,
+}
+
+// HERDR: script editor construction options, decoded before retaining any state.
+#[derive(serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct EditorOptions {
+    pub language: String,
+    pub value: String,
+    pub line_numbers: bool,
+    pub folding: bool,
+    pub readonly: bool,
+    pub soft_wrap: bool,
+    pub syntax: HashMap<String, String>,
+    pub font_family: Option<String>,
+    pub font_size: Option<f32>,
+}
+
+impl Default for EditorOptions {
+    fn default() -> Self {
+        Self {
+            language: String::new(),
+            value: String::new(),
+            line_numbers: true,
+            folding: true,
+            readonly: false,
+            soft_wrap: false,
+            syntax: HashMap::new(),
+            font_family: None,
+            font_size: None,
+        }
+    }
 }
 
 type OtpHandler = dyn Fn(&OtpEvent, &mut Window, &mut App);
@@ -260,11 +312,14 @@ impl EntityStore {
             Record::View { .. } => Some("View"),
             Record::Input { .. } => Some("InputState"),
             Record::Textarea { .. } => Some("TextareaState"),
+            // HERDR: expose the distinct code-editor handle type.
+            Record::Editor { .. } => Some("EditorState"),
             Record::Calendar { .. } => Some("CalendarState"),
             Record::Slider { .. } => Some("SliderState"),
             Record::Otp { .. } => Some("OtpState"),
             Record::Focus { .. } => Some("FocusHandle"),
             Record::Dock { .. } => Some("DockArea"),
+            Record::Scroll { .. } => Some("ScrollHandle"),
             Record::VirtualScroll { .. } => Some("VirtualListScrollHandle"),
         }
     }
@@ -399,6 +454,64 @@ impl EntityStore {
         match self.record(handle) {
             Some(Record::Textarea { state, .. }) => Some(state.clone()),
             _ => None,
+        }
+    }
+
+    // HERDR: code editors ship with syntax support; unset UI colors follow the live palette.
+    pub(crate) fn create_editor(
+        &mut self,
+        options: EditorOptions,
+        style: InputEditorStyle,
+        application: Option<Rc<ApplicationGeneration>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<EntityHandle, EntityLimitError> {
+        self.ensure_capacity()?;
+        let state = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx)
+                .language(options.language)
+                .line_number(options.line_numbers)
+                .folding(options.folding)
+                .soft_wrap(options.soft_wrap);
+            state.set_readonly(options.readonly, cx);
+            state.set_editor_style(style);
+            state.set_highlighter_factory(
+                Rc::new(|language| {
+                    crate::syntax::SyntectHighlighter::new(language).map(|highlighter| {
+                        Box::new(highlighter) as Box<dyn gpui_base::input::InputHighlighter>
+                    })
+                }),
+                cx,
+            );
+            state
+        });
+        state.update(cx, |state, cx| state.set_value(options.value, window, cx));
+        self.push(Record::Editor {
+            state,
+            font_family: options.font_family,
+            font_size: options.font_size,
+            application,
+            subscriptions: Vec::new(),
+        })
+    }
+
+    // HERDR: never resolve an editor as an input or textarea.
+    pub fn editor(&self, handle: EntityHandle) -> Option<Entity<EditorState>> {
+        match self.record(handle) {
+            Some(Record::Editor { state, .. }) => Some(state.clone()),
+            _ => None,
+        }
+    }
+
+    // HERDR: theme defaults are resolved at render time, not frozen at construction.
+    pub(crate) fn editor_font(&self, handle: EntityHandle) -> (Option<String>, Option<f32>) {
+        match self.record(handle) {
+            Some(Record::Editor {
+                font_family,
+                font_size,
+                ..
+            }) => (font_family.clone(), *font_size),
+            _ => (None, None),
         }
     }
 
@@ -669,6 +782,20 @@ impl EntityStore {
         }
     }
 
+    pub(crate) fn create_scroll(
+        &mut self,
+        application: Option<Rc<ApplicationGeneration>>,
+    ) -> Result<EntityHandle, EntityLimitError> {
+        self.push(Record::Scroll { handle: PlainScrollHandle::default(), application })
+    }
+
+    pub(crate) fn scroll(&self, handle: EntityHandle) -> Option<PlainScrollHandle> {
+        match self.record(handle) {
+            Some(Record::Scroll { handle, .. }) => Some(handle.clone()),
+            _ => None,
+        }
+    }
+
     /// Creates a virtualized list's scroll position and returns its handle.
     ///
     /// Refused during render for the same reason the rest are: a handle created
@@ -718,11 +845,19 @@ impl EntityStore {
             Some(Record::Textarea { state, .. }) => {
                 subscribe_to_events(&state.clone(), event, window, cx, handler)
             }
+            // HERDR: code editors emit the same input events.
+            Some(Record::Editor { state, .. }) => {
+                subscribe_to_events(&state.clone(), event, window, cx, handler)
+            }
             _ => return false,
         };
 
         match self.record_mut(handle) {
-            Some(Record::Input { subscriptions, .. } | Record::Textarea { subscriptions, .. }) => {
+            Some(
+                Record::Input { subscriptions, .. }
+                | Record::Textarea { subscriptions, .. }
+                | Record::Editor { subscriptions, .. },
+            ) => {
                 subscriptions.push(subscription);
                 true
             }
@@ -907,10 +1042,15 @@ impl EntityStore {
                 | Record::Textarea {
                     application: owner, ..
                 }
+                // HERDR: unload editors and their subscriptions with the owning mod.
+                | Record::Editor { application: owner, .. }
                 | Record::Slider {
                     application: owner, ..
                 }
                 | Record::Focus {
+                    application: owner, ..
+                }
+                | Record::Scroll {
                     application: owner, ..
                 }
                 | Record::VirtualScroll {
@@ -1047,6 +1187,17 @@ impl EntityStore {
             })
     }
 
+    // HERDR: test the native editing/readonly behavior behind script handles.
+    #[cfg(test)]
+    pub(crate) fn first_editor(&self) -> Option<Entity<EditorState>> {
+        self.records
+            .values()
+            .find_map(|stored| match &stored.record {
+                Record::Editor { state, .. } => Some(state.clone()),
+                _ => None,
+            })
+    }
+
     #[cfg(test)]
     pub(crate) fn first_input(&self) -> Option<Entity<InputState>> {
         self.records
@@ -1140,6 +1291,8 @@ pub enum InputEventName {
     Submit,
     Focus,
     Blur,
+    /// A paste with no text on the clipboard (an image): the script reads it.
+    PasteOther,
 }
 
 impl InputEventName {
@@ -1149,11 +1302,12 @@ impl InputEventName {
             "submit" => Some(Self::Submit),
             "focus" => Some(Self::Focus),
             "blur" => Some(Self::Blur),
+            "paste_other" => Some(Self::PasteOther),
             _ => None,
         }
     }
 
-    pub const NAMES: &'static [&'static str] = &["change", "submit", "focus", "blur"];
+    pub const NAMES: &'static [&'static str] = &["change", "submit", "focus", "blur", "paste_other"];
 
     fn matches(self, event: &InputEvent) -> bool {
         matches!(
@@ -1162,6 +1316,7 @@ impl InputEventName {
                 | (Self::Submit, InputEvent::PressEnter { .. })
                 | (Self::Focus, InputEvent::Focus)
                 | (Self::Blur, InputEvent::Blur)
+                | (Self::PasteOther, InputEvent::PasteWithoutText)
         )
     }
 }

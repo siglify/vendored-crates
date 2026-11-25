@@ -2467,7 +2467,7 @@ impl Paragraph {
 
         if self.should_render_inline_flow() {
             return InlineFlow::new(
-                leaf_element_id(fade_key),
+                leaf_element_id(fade_key, self),
                 self.inline_flow_items(fade_key, fades, backgrounds, node_cx, cx),
                 node_cx.link_click_handler.clone(),
             )
@@ -2645,7 +2645,7 @@ impl Paragraph {
         }
 
         div()
-            .id(leaf_element_id(fade_key))
+            .id(leaf_element_id(fade_key, self))
             .children(child_nodes)
             .into_any_element()
     }
@@ -2831,9 +2831,15 @@ fn block_element_id(kind: &'static str, span: Option<Span>, ix: usize) -> Elemen
 /// The element id of a paragraph that needs one: an inline flow, whose
 /// objects are accessibility nodes, or an image, whose element state is its
 /// animation. The leaf key is unique per paragraph in a parsed Markdown
-/// document; the HTML parser records no spans, so its paragraphs share one.
-fn leaf_element_id(fade_key: Option<TextLeafKey>) -> ElementId {
-    fade_key.map_or_else(|| ElementId::from("p"), ElementId::from)
+/// document; the HTML parser records no spans, so its paragraphs fall back to
+/// the paragraph's address, stable while the parsed document lives.
+/// HERDR: was a shared "p", so two inline flows in one HTML block shared
+/// layout state and the first painted the second's layout (index panic).
+fn leaf_element_id(fade_key: Option<TextLeafKey>, paragraph: &Paragraph) -> ElementId {
+    fade_key.map_or_else(
+        || ElementId::from(("p", paragraph as *const Paragraph as usize)),
+        ElementId::from,
+    )
 }
 
 /// A link's underline: a hairline in a translucent link color, so a run of

@@ -13,6 +13,7 @@ mod host_api;
 mod http_request;
 mod network;
 mod process;
+mod reload_tasks;
 mod render;
 mod snapshot;
 mod standard_runtime;

@@ -1592,8 +1592,10 @@ fn successful_application_reload_purges_old_state_and_keeps_new_generation(
         format!(
             r#"
 import {{ ReloadState }} from "gpui-component";
-ReloadState();
-export default class Reloaded {{ render() {{ return "version {version}"; }} }}
+export default class Reloaded {{
+  constructor() {{ ReloadState(); }}
+  render() {{ return "version {version}"; }}
+}}
 "#
         )
     };
@@ -1612,7 +1614,7 @@ export default class Reloaded {{ render() {{ return "version {version}"; }} }}
             runtime.load_app(&directory, "main.js")
         })
         .unwrap();
-    std::fs::write(directory.join("main.js"), source(2)).unwrap();
+    std::fs::write(directory.join("main.js"), source(22)).unwrap();
     let second = context
         .update(|window, cx| {
             let (_scope, _) = crate::scope::enter_runtime(
@@ -2197,6 +2199,8 @@ export default class PointerRebuild extends View {
     this.hoverEvents = 0;
     this.moveFunction = null;
     this.clickFunction = null;
+    this.buttonHovered = false;
+    this.buttonHoverEvents = 0;
   }
   render(cx) {
     return v_flex()
@@ -2224,12 +2228,17 @@ export default class PointerRebuild extends View {
         Button.new("after-hover")
           .w(300)
           .h(80)
+          .on_hover((hovered, cx) => {
+            this.buttonHoverEvents += 1;
+            this.buttonHovered = hovered;
+            cx.notify();
+          })
           .on_click((event, cx) => {
             this.clicks += 1;
             this.clickFunction = event.modifiers.function;
             cx.notify();
           })
-          .child(`Clicks: ${this.clicks}; Click function: ${this.clickFunction}`),
+          .child(`Clicks: ${this.clicks}; Click function: ${this.clickFunction}; Button hovered: ${this.buttonHovered}; Button hover events: ${this.buttonHoverEvents}`),
       );
   }
 }
@@ -2271,10 +2280,18 @@ export default class PointerRebuild extends View {
     context.run_until_parked();
     context.update(|window, cx| window.draw(cx).clear(cx));
     assert!(tree(&mut context).contains("Hovered: false"));
+    assert!(tree(&mut context).contains("Button hovered: true"));
+    assert!(tree(&mut context).contains("Button hover events: 1"));
     assert!(
         tree(&mut context).contains("Hover events: 2"),
         "leaving the element must still dispatch a real exit"
     );
+
+    context.simulate_mouse_move(point(px(20.), px(200.)), None, Modifiers::default());
+    context.run_until_parked();
+    context.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(tree(&mut context).contains("Button hovered: false"));
+    assert!(tree(&mut context).contains("Button hover events: 2"));
 
     context.simulate_click(point(px(20.), px(120.)), Modifiers::default());
     context.run_until_parked();
@@ -5663,6 +5680,154 @@ export default class Note extends View {
     // — or the other way round — would fail here rather than in a story.
     let view = context.update(|_, cx| cx.new(|_| ScriptView::new(runtime, object)));
     draw(&mut context, &view);
+}
+
+// HERDR: exercise editor exports, retained value/events, and materialization beside an input.
+#[gpui::test]
+fn an_editor_holds_highlighted_code_beside_an_input(cx: &mut TestAppContext) {
+    cx.update(|cx| crate::init(cx));
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r##"
+import { View, div } from "gpui-kit";
+import { Input, InputState, Editor, EditorState } from "gpui-base";
+export default class Code extends View {
+  init() {
+    this.title = InputState.new({ value: "Code" });
+    this.code = EditorState.new({
+      language: "rust", value: "fn main() {\\n    println!(\"hello\");\\n}",
+      line_numbers: true, folding: true, soft_wrap: false,
+      font_family: "DejaVu Sans Mono", font_size: 15,
+      syntax: { keyword: "#c678dd", "string.escape": "#ff0000" },
+    });
+    this.changes = 0;
+    this.code.on("change", () => { this.changes += 1; });
+    this.code.set_value("fn main() {\\n    let answer = 42;\\n}");
+  }
+  render(cx) {
+    return div().child(Input.new(this.title))
+      .child(Editor.new(this.code).h(240)).child(this.code.value()).child("changes=" + this.changes);
+  }
+}
+"##;
+    let view_type = runtime.load_source("code", source).expect("load");
+    let window = cx.add_window(|_, _| Empty);
+    let mut context = VisualTestContext::from_window(*window.deref(), cx);
+    let object = context
+        .update(|window, cx| runtime.instantiate(&view_type, window, cx))
+        .expect("instantiate");
+    let tree = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("editor render");
+    assert!(tree.contains("Editor #"), "{tree}");
+    assert!(tree.contains("Input #"), "{tree}");
+    assert!(tree.contains("answer = 42"), "{tree}");
+    let editor = runtime.entities().first_editor().expect("editor");
+    context.update(|_, cx| {
+        assert_eq!(editor.read(cx).language_name().as_ref(), "rust");
+        assert!(editor.read(cx).is_editable());
+    });
+    let view = context.update(|_, cx| cx.new(|_| ScriptView::new(runtime.clone(), object.clone())));
+    draw(&mut context, &view);
+    context.update(|window, cx| {
+        editor.update(cx, |state, cx| {
+            state.insert("// changed\\n", window, cx);
+        })
+    });
+    draw(&mut context, &view);
+    let tree = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("editor change event");
+    assert!(tree.contains("changes=1"), "{tree}");
+}
+
+// HERDR: an editor reads and replaces its selection like a textarea, so a script can format it.
+#[gpui::test]
+fn a_script_editor_reads_and_replaces_its_selection(cx: &mut TestAppContext) {
+    cx.update(|cx| crate::init(cx));
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r#"
+import { View, div } from "gpui-kit";
+import { Editor, EditorState } from "gpui-base";
+export default class Notes extends View {
+  init() {
+    this.code = EditorState.new({ language: "markdown", value: "héllo world" });
+    this.code.set_selected_range({ start: 6, end: 11 });
+    const picked = this.code.selected_range();
+    this.code.replace("**world**");
+    const after = this.code.selected_range();
+    this.report = `picked=${picked.start}-${picked.end} after=${after.start}-${after.end}`;
+  }
+  render(cx) {
+    return div().child(Editor.new(this.code).h(120)).child(this.code.value()).child(this.report);
+  }
+}
+"#;
+    let view_type = runtime.load_source("selection", source).expect("load");
+    let window = cx.add_window(|_, _| Empty);
+    let mut context = VisualTestContext::from_window(*window.deref(), cx);
+    let object = context
+        .update(|window, cx| runtime.instantiate(&view_type, window, cx))
+        .expect("instantiate");
+    let tree = context
+        .update(|window, cx| runtime.render_to_spec(&object, None, window, cx))
+        .expect("editor render");
+    assert!(tree.contains("héllo **world**"), "{tree}");
+    assert!(tree.contains("picked=6-11 after=15-15"), "{tree}");
+}
+
+// HERDR: readonly rejects keyboard edits without disabling selection or programmatic refresh.
+#[gpui::test]
+fn a_readonly_script_editor_remains_selectable(cx: &mut TestAppContext) {
+    cx.update(|cx| crate::init(cx));
+    let runtime = ShellRuntime::new_isolated().expect("runtime");
+    cx.update(|cx| runtime.set_global(cx));
+    let source = r#"
+import { View } from "gpui-kit";
+import { Editor, EditorState } from "gpui-base";
+export default class Code extends View {
+  init() {
+    this.code = EditorState.new({language: "rust", value: "original", readonly: true});
+    this.code.set_value("fn main() {}");
+  }
+  render(cx) { return Editor.new(this.code).h(240); }
+}
+"#;
+    let view_type = runtime.load_source("readonly-code", source).expect("load");
+    let runtime_for_view = runtime.clone();
+    let (_root, context) = cx.add_window_view(move |window, cx| {
+        let object = runtime_for_view
+            .instantiate(&view_type, window, cx)
+            .expect("instantiate");
+        let view = cx.new(|_| ScriptView::new(runtime_for_view, object));
+        crate::root::ShellRoot::new(view.into(), window, cx)
+    });
+    context.update(|window, cx| window.draw(cx).clear(cx));
+    let editor = runtime.entities().first_editor().expect("editor");
+    context.update(|window, cx| {
+        editor.update(cx, |state, cx| {
+            assert!(!state.is_editable());
+            state.focus(window, cx);
+            state.set_selected_range(0..2, cx);
+            assert_eq!(state.selected_value().as_ref(), "fn");
+        })
+    });
+    context.update(|window, cx| window.draw(cx).clear(cx));
+    context.simulate_keystrokes("ctrl-c");
+    context.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("fn")
+        );
+    });
+    context.simulate_keystrokes("a backspace enter");
+    context.update(|_, cx| {
+        assert_eq!(editor.read(cx).value().as_ref(), "fn main() {}");
+        assert_eq!(editor.read(cx).selected_value().as_ref(), "fn");
+    });
 }
 
 #[gpui::test]

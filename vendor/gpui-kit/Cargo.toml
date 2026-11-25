@@ -1,46 +1,11 @@
+# Vendored from https://github.com/longbridge/gpui-kit at 1ccf011: only the
+# crates Herdr uses. Herdr patches are marked `HERDR:`.
 [workspace]
-default-members = ["crates/story"]
 members = [
-    "crates/kit",
     "crates/base",
-    "crates/base/examples/wasm",
-    "crates/base/examples/native",
-    "crates/component-macros",
-    "crates/story",
-    "crates/story-web",
-    "crates/component",
-    "crates/assets",
     "crates/fps",
-    "crates/webview",
-    "examples/app_assets",
-    "examples/fps_monitor",
-    "examples/hello_world",
-    "examples/input",
-    "examples/editor",
-    "examples/tig",
-    "examples/brush",
-    "examples/dock",
-    "examples/html",
-    "examples/large-text",
-    "examples/markdown",
-    "examples/stream-markdown",
-    "examples/window_title",
-    "examples/dialog_overlay",
-    "examples/webview",
-    "examples/system_monitor",
-    "examples/focus_trap",
-    "examples/tooltip_top_edge",
-    "examples/sidebar",
-    "examples/text_max_lines",
-    "examples/text_selection",
-    "examples/touch_selection",
-    "examples/table_in_scrollable",
-    "examples/markdown_table",
-    "examples/ai_recipes",
-    "examples/speech",
     "crates/shell",
     "crates/shell/rquickjs-compat",
-    "crates/component-shell",
 ]
 resolver = "2"
 
